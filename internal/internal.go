@@ -1,3 +1,5 @@
+// Modified by Tracefort (2026) from kanywst/opa-authzen-plugin; see NOTICE.
+
 package internal
 
 import (
@@ -16,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/open-policy-agent/opa/v1/logging"
 	"github.com/open-policy-agent/opa/v1/plugins"
@@ -121,6 +124,19 @@ type Config struct {
 	// checks its shape and its agreement with this config but cannot verify
 	// the signature. Empty omits it.
 	SignedMetadata string `json:"signed_metadata,omitempty"`
+	// BaseURL is the Policy Decision Point identifier (Section 9.1.1): the
+	// URL the metadata document is published under, from which every
+	// advertised endpoint is built. A PEP MUST NOT use metadata whose
+	// `policy_decision_point` differs from the URL it fetched it from, so a
+	// PDP behind a proxy should pin this rather than rely on the request's
+	// Host and X-Forwarded-* headers. The Access Request and Approval Profile
+	// also uses it as the `iss` of a signed `binding_token` and the audience
+	// an `approval.state` must name. Empty derives it from the request.
+	BaseURL string `json:"base_url,omitempty"`
+	// AccessRequest configures the PDP's part of the AuthZEN Access Request
+	// and Approval Profile beyond discovery: requestable-denial issuance and
+	// approval verification at re-evaluation. See access_request.go.
+	AccessRequest AccessRequestConfig `json:"access_request,omitempty"`
 }
 
 // SearchConfig configures the optional Search APIs (Section 8 of the AuthZEN
@@ -204,6 +220,25 @@ func Validate(_ *plugins.Manager, bs []byte) (*Config, error) {
 			return nil, fmt.Errorf("%s %q must be an https:// URI with a host", field.name, *field.value)
 		}
 		*field.value = trimmed
+	}
+
+	cfg.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+	if cfg.BaseURL != "" {
+		u, err := url.Parse(cfg.BaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("base_url %q is not a valid URL: %w", cfg.BaseURL, err)
+		}
+		// Section 9.1.1: an identifier with no query or fragment component.
+		// http is accepted for local development; the spec expects https.
+		if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+			return nil, fmt.Errorf("base_url %q must be an http(s) URL with a host and no query or fragment", cfg.BaseURL)
+		}
+	}
+
+	// Before signed_metadata, which is checked against the jwks_uri this may
+	// derive.
+	if err := cfg.AccessRequest.load(&cfg); err != nil {
+		return nil, fmt.Errorf("access_request: %w", err)
 	}
 
 	cfg.SignedMetadata = strings.TrimSpace(cfg.SignedMetadata)
@@ -381,6 +416,9 @@ type AuthZenPlugin struct {
 	started bool
 	stopped bool
 	logger  logging.Logger
+	// now is the clock used for requestable-denial and approval timestamps;
+	// tests replace it.
+	now func() time.Time
 }
 
 // New creates a new AuthZenPlugin.
@@ -389,6 +427,7 @@ func New(m *plugins.Manager, cfg *Config) *AuthZenPlugin {
 		manager: m,
 		cfg:     *cfg,
 		logger:  m.Logger().WithFields(map[string]any{"plugin": PluginName}),
+		now:     time.Now,
 	}
 }
 
@@ -408,6 +447,7 @@ func (p *AuthZenPlugin) Start(_ context.Context) error {
 		p.manager.ExtraRoute("POST /access/v1/search/resource", "authzen/search-resource", p.handleResourceSearch)
 		p.manager.ExtraRoute("POST /access/v1/search/action", "authzen/search-action", p.handleActionSearch)
 		p.manager.ExtraRoute("GET /.well-known/authzen-configuration", "authzen/well-known", p.handleWellKnown)
+		p.manager.ExtraRoute("GET "+jwksPath, "authzen/jwks", p.handleJWKS)
 	}
 
 	p.manager.UpdatePluginStatus(PluginName, &plugins.Status{State: plugins.StateOK})
@@ -874,8 +914,9 @@ func (p *AuthZenPlugin) handleEvaluation(w http.ResponseWriter, r *http.Request)
 	}
 	defer p.manager.Store.Abort(r.Context(), txn)
 
-	path, decisionRule, ctxRule, obligations := p.configSnapshot()
-	applyObligationNegotiation(input, obligations)
+	snap := p.configSnapshot()
+	path, decisionRule := snap.path, snap.decision
+	p.prepareInput(input, &snap)
 	ev := p.newDecisionLog(r, txn, path, decisionRule).begin()
 
 	decision, err := p.evalDecision(r.Context(), txn, input, path, decisionRule, ev.regoOptions()...)
@@ -886,7 +927,7 @@ func (p *AuthZenPlugin) handleEvaluation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	decisionCtx, err := p.evalDecisionContext(r.Context(), txn, input, path, ctxRule, ev.regoOptions()...)
+	decisionCtx, err := p.evalDecisionContext(r.Context(), txn, input, &snap, decision, ev.regoOptions()...)
 	if err != nil {
 		p.logger.WithFields(map[string]any{"path": path, "error": err}).Error("AuthZEN decision context error")
 		ev.log(input, nil, err)
@@ -923,10 +964,36 @@ func (p *AuthZenPlugin) evalDecision(ctx context.Context, txn storage.Transactio
 // configSnapshot reads the settings that an evaluation request depends on
 // under a single lock acquisition, so a request observes one coherent config
 // even when a concurrent Reconfigure lands mid-request.
-func (p *AuthZenPlugin) configSnapshot() (path, decisionRule, contextRule string, obligations []string) {
+func (p *AuthZenPlugin) configSnapshot() evalConfig {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.cfg.Path, p.cfg.Decision, p.cfg.DecisionContext, p.cfg.SupportedObligations
+	return evalConfig{
+		path:                  p.cfg.Path,
+		decision:              p.cfg.Decision,
+		contextRule:           p.cfg.DecisionContext,
+		obligations:           p.cfg.SupportedObligations,
+		accessRequestEndpoint: p.cfg.AccessRequestEndpoint,
+		baseURL:               p.cfg.BaseURL,
+		accessRequest:         p.cfg.AccessRequest,
+	}
+}
+
+// evalConfig is the configuration one evaluation request runs under.
+type evalConfig struct {
+	path, decision, contextRule string
+	obligations                 []string
+	accessRequestEndpoint       string
+	baseURL                     string
+	accessRequest               AccessRequestConfig
+}
+
+// prepareInput applies the profile processing that runs on a validated input
+// before any rule sees it: obligation negotiation (Obligations Profile) and,
+// when configured, approval verification (Access Request and Approval
+// Profile).
+func (p *AuthZenPlugin) prepareInput(input map[string]any, snap *evalConfig) {
+	applyObligationNegotiation(input, snap.obligations)
+	p.verifyApproval(input, snap)
 }
 
 // evalDecisionContext evaluates the configured decision-context rule (if any)
@@ -937,12 +1004,19 @@ func (p *AuthZenPlugin) configSnapshot() (path, decisionRule, contextRule string
 // The spec requires `context` to be an object, so a non-object result is
 // reported as an error. Shares the caller's transaction and configSnapshot
 // with the decision evaluation.
-func (p *AuthZenPlugin) evalDecisionContext(ctx context.Context, txn storage.Transaction, input map[string]any, path, rule string, opts ...func(*rego.Rego)) (json.RawMessage, error) {
+//
+// The policy's object then passes through the profile checks that bind the
+// PDP rather than the policy author (finalizeDecisionContext): obligation
+// shape, and the requestable-denial members of the Access Request and
+// Approval Profile. A context those checks reject fails the request, as a
+// non-object result does.
+func (p *AuthZenPlugin) evalDecisionContext(ctx context.Context, txn storage.Transaction, input map[string]any, snap *evalConfig, decision bool, opts ...func(*rego.Rego)) (json.RawMessage, error) {
+	rule := snap.contextRule
 	if rule == "" {
 		return nil, nil
 	}
 
-	val, err := p.evalRuleWithTxn(ctx, txn, input, path, rule, opts...)
+	val, err := p.evalRuleWithTxn(ctx, txn, input, snap.path, rule, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -952,6 +1026,9 @@ func (p *AuthZenPlugin) evalDecisionContext(ctx context.Context, txn storage.Tra
 	obj, ok := val.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("decision_context rule %q must return an object; got %T", rule, val)
+	}
+	if err := p.finalizeDecisionContext(obj, input, decision, snap); err != nil {
+		return nil, fmt.Errorf("decision_context rule %q: %w", rule, err)
 	}
 	if len(obj) == 0 {
 		return nil, nil
@@ -1050,8 +1127,9 @@ func (p *AuthZenPlugin) handleEvaluations(w http.ResponseWriter, r *http.Request
 		}
 		defer p.manager.Store.Abort(r.Context(), txn)
 
-		path, decisionRule, ctxRule, obligations := p.configSnapshot()
-		applyObligationNegotiation(input, obligations)
+		snap := p.configSnapshot()
+		path, decisionRule := snap.path, snap.decision
+		p.prepareInput(input, &snap)
 		ev := p.newDecisionLog(r, txn, path, decisionRule).begin()
 		decision, err := p.evalDecision(r.Context(), txn, input, path, decisionRule, ev.regoOptions()...)
 		if err != nil {
@@ -1060,7 +1138,7 @@ func (p *AuthZenPlugin) handleEvaluations(w http.ResponseWriter, r *http.Request
 			jsonError(w, "evaluation failed", http.StatusInternalServerError)
 			return
 		}
-		decisionCtx, err := p.evalDecisionContext(r.Context(), txn, input, path, ctxRule, ev.regoOptions()...)
+		decisionCtx, err := p.evalDecisionContext(r.Context(), txn, input, &snap, decision, ev.regoOptions()...)
 		if err != nil {
 			p.logger.WithFields(map[string]any{"path": path, "error": err}).Error("AuthZEN decision context error")
 			ev.log(input, nil, err)
@@ -1106,7 +1184,8 @@ func (p *AuthZenPlugin) handleEvaluations(w http.ResponseWriter, r *http.Request
 
 	// Snapshot config once for the whole batch: one coherent (path, decision,
 	// context, obligations) tuple, and no per-iteration lock churn.
-	path, decisionRule, ctxRule, obligations := p.configSnapshot()
+	snap := p.configSnapshot()
+	path, decisionRule := snap.path, snap.decision
 	// Each evaluated item is a decision of its own; they share a batch ID.
 	dl := p.newDecisionLog(r, txn, path, decisionRule).forBatch()
 
@@ -1136,7 +1215,7 @@ func (p *AuthZenPlugin) handleEvaluations(w http.ResponseWriter, r *http.Request
 			}
 			continue
 		}
-		applyObligationNegotiation(input, obligations)
+		p.prepareInput(input, &snap)
 		ev := dl.begin()
 
 		decision, err := p.evalDecision(r.Context(), txn, input, path, decisionRule, ev.regoOptions()...)
@@ -1175,7 +1254,7 @@ func (p *AuthZenPlugin) handleEvaluations(w http.ResponseWriter, r *http.Request
 		// Surface the optional policy-supplied decision context (Section
 		// 5.5.1) on non-short-circuit results. Short-circuit results above
 		// carry the plugin's own reason context instead.
-		decisionCtx, err := p.evalDecisionContext(r.Context(), txn, input, path, ctxRule, ev.regoOptions()...)
+		decisionCtx, err := p.evalDecisionContext(r.Context(), txn, input, &snap, decision, ev.regoOptions()...)
 		if err != nil {
 			p.logger.WithFields(map[string]any{"path": path, "error": err}).Error("AuthZEN batch decision context error")
 			ev.log(input, nil, err)
@@ -1212,26 +1291,17 @@ func (p *AuthZenPlugin) handleWellKnown(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Determine the scheme and host for constructing the base URL.
-	// NOTE: The Host header and X-Forwarded-* headers are trusted here.
-	// In production, this endpoint should be behind a reverse proxy that
-	// overrides or sanitizes these headers. If exposed directly, a client
-	// could spoof these values to influence the metadata response.
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	if proto := r.Header.Get("X-Forwarded-Proto"); proto == "http" || proto == "https" {
-		scheme = proto
-	}
-	host := r.Host
-	if host == "" {
-		host = r.Header.Get("X-Forwarded-Host")
-	}
-	if host == "" {
-		host = "localhost"
-	}
-	base := fmt.Sprintf("%s://%s", scheme, host)
+	p.mu.RLock()
+	search := p.cfg.Search
+	capabilities := p.cfg.Capabilities
+	obligations := p.cfg.SupportedObligations
+	accessRequestEndpoint := p.cfg.AccessRequestEndpoint
+	jwksURI := p.cfg.JWKSURI
+	signedMetadata := p.cfg.SignedMetadata
+	baseURL := p.cfg.BaseURL
+	p.mu.RUnlock()
+
+	base := requestBaseURL(r, baseURL)
 	metadata := pdpMetadata{
 		PolicyDecisionPoint:       base,
 		AccessEvaluationEndpoint:  base + "/access/v1/evaluation",
@@ -1240,14 +1310,6 @@ func (p *AuthZenPlugin) handleWellKnown(w http.ResponseWriter, r *http.Request) 
 
 	// Spec Section 9: omit search_*_endpoint when the corresponding rule is
 	// unconfigured. Absence is the PEP's signal that the PDP is not capable.
-	p.mu.RLock()
-	search := p.cfg.Search
-	capabilities := p.cfg.Capabilities
-	obligations := p.cfg.SupportedObligations
-	accessRequestEndpoint := p.cfg.AccessRequestEndpoint
-	jwksURI := p.cfg.JWKSURI
-	signedMetadata := p.cfg.SignedMetadata
-	p.mu.RUnlock()
 	if search.Subject != "" {
 		metadata.SearchSubjectEndpoint = base + "/access/v1/search/subject"
 	}
@@ -1279,6 +1341,56 @@ func (p *AuthZenPlugin) handleWellKnown(w http.ResponseWriter, r *http.Request) 
 	if err := json.NewEncoder(w).Encode(metadata); err != nil {
 		p.logger.Error("AuthZEN well-known: failed to encode response: %v", err)
 	}
+}
+
+// requestBaseURL returns the Policy Decision Point identifier the metadata
+// document is published under (Section 9.1.1). A configured base_url wins.
+// Otherwise it is rebuilt from the request as a client reached it: the
+// forwarded scheme and host a reverse proxy set, else the request's own.
+//
+// The headers are trusted, so a PDP exposed without a proxy that overwrites
+// them lets a client choose the URLs it is told about; base_url closes that.
+func requestBaseURL(r *http.Request, configured string) string {
+	if configured != "" {
+		return configured
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if proto := strings.ToLower(firstForwardedValue(r.Header.Get("X-Forwarded-Proto"))); proto == "http" || proto == "https" {
+		scheme = proto
+	}
+	host := firstForwardedValue(r.Header.Get("X-Forwarded-Host"))
+	if !validForwardedHost(host) {
+		host = r.Host
+	}
+	if host == "" {
+		host = "localhost"
+	}
+	return scheme + "://" + host
+}
+
+// firstForwardedValue returns the first entry of an X-Forwarded-* header,
+// which proxies append to as a comma-separated list; the first is the value
+// the client originally sent.
+func firstForwardedValue(v string) string {
+	first, _, _ := strings.Cut(v, ",")
+	return strings.TrimSpace(first)
+}
+
+// validForwardedHost rejects a forwarded host that would not be a host[:port]
+// authority, so a malformed header falls back to the request Host rather
+// than producing a URL with a path, userinfo or whitespace in it.
+func validForwardedHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if strings.ContainsAny(host, "/\\@?# \t") {
+		return false
+	}
+	u, err := url.Parse("http://" + host)
+	return err == nil && u.Host == host
 }
 
 // handleSubjectSearch serves POST /access/v1/search/subject (Section 8.4).
@@ -1388,6 +1500,9 @@ func (p *AuthZenPlugin) handleSearch(w http.ResponseWriter, r *http.Request, kin
 	}
 
 	entities, errMsg := normaliseSearchResults(raw, kind)
+	if errMsg == "" {
+		errMsg = validateSearchObligations(entities, obligations)
+	}
 	if errMsg != "" {
 		p.logger.WithFields(map[string]any{"path": path, "rule": ruleName, "error": errMsg}).Error("AuthZEN search: invalid policy result")
 		ev.log(input, nil, errors.New(errMsg))

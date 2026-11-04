@@ -36,3 +36,22 @@ plugins:
     # (spec Section 9.1.3). Sign it outside the plugin; it must carry `iss`, and
     # any claim that mirrors a setting above must match that setting.
     # signed_metadata: "<header>.<claims>.<signature>"
+    # Optional: pin the PDP identifier (spec Section 9.1.1) that every endpoint
+    # in the metadata is built from. Unset derives it from the request's
+    # X-Forwarded-Proto/X-Forwarded-Host (first value) or Host. Required by the
+    # access_request signing and approval settings below.
+    # base_url: "https://pdp.example.com"
+    # Optional: the PDP's part of the Access Request and Approval Profile.
+    # Requestable denials returned by `decision_context` are completed with
+    # `expires_at`, `evaluation_id` and, with a signing key, a signed
+    # `binding_token`; a PEP's `context.approval` is verified against the
+    # trusted issuers before the policy sees it. Keys are served at
+    # /access/v1/jwks and advertised as `jwks_uri` unless one is set above.
+    # access_request:
+    #   signing_key_file: /etc/authzen/pdp-signing.jwk
+    #   audience: "https://requests.example.com"
+    #   denial_ttl: 10m
+    #   binding_context_members: ["project"]
+    #   approval_issuers:
+    #     - issuer: "https://requests.example.com"
+    #       jwks_file: /etc/authzen/ars-jwks.json

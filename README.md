@@ -62,9 +62,13 @@ The plugin registers AuthZEN endpoints directly on OPA's own HTTP server (`:8181
 | Section 10.1 | HTTPS Transport Binding (JSON serialization, Content-Type validation) | ✅ Supported |
 | Section 10.1.3 | X-Request-ID echo | ✅ Supported |
 | Section 11.7 | Request payload protection (body size limit, batch size limit) | ✅ Supported |
+| Section 9.1.1 | Pinned PDP identifier (`base_url`); forwarded host honored otherwise | ✅ Supported |
 | [Obligations Profile (Draft 1)](https://openid.github.io/authzen/authzen-obligations-profile-1_0.html) | Obligation discovery and PEP-capability negotiation | ✅ Supported (opt-in via `supported_obligations`) |
+| [Obligations Profile (Draft 1)](https://openid.github.io/authzen/authzen-obligations-profile-1_0.html) | Obligation object checks (Decision context and per Search result), Normative Obligation Types | ✅ Supported (with `supported_obligations`) |
 | [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | PDP discovery: `access_request_endpoint`, `jwks_uri`, capability URN | ✅ Supported (opt-in) — see [below](#access-request-and-approval-profile) |
-| [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | Access Request / Task Status endpoints, approval workflow, token signing | ❌ Not implemented — the profile permits a separate service to host these |
+| [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | Requestable-denial issuance: placement rules, `expires_at`, `evaluation_id`, signed `binding_token`, served JWK Set | ✅ Supported (opt-in) |
+| [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | Approval verification at re-evaluation (`approval.state`, exact-match scope) | ✅ Supported (opt-in via `access_request.approval_issuers`) |
+| [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | Access Request / Task Status endpoints, approval workflow | ❌ Not implemented — the profile permits a separate service to host these |
 
 The Authorization API itself is final at 1.0. The two profiles are not: both are titled **Draft 1** upstream, and the `1_0` in their filenames and URLs is the document name, not a released version. Support for them is opt-in and their normative text can still move — the denial-binding rules in the Access Request and Approval profile changed in September 2026, after this plugin shipped support for its discovery members.
 
@@ -256,6 +260,12 @@ The plugin is configured under the `plugins.authzen` key in the OPA config file:
 | `access_request_endpoint` | string | _(unset)_ | HTTPS URI advertised as `access_request_endpoint` in the PDP metadata (Access Request and Approval Profile) |
 | `jwks_uri`          | string | _(unset)_ | HTTPS URI advertised as `jwks_uri` in the PDP metadata, for verifying signed values issued under that profile |
 | `signed_metadata`   | string | _(unset)_ | Compact JWS advertised as `signed_metadata` in the PDP metadata (spec Section 9.1.3) |
+| `base_url`          | string | _(unset)_ | PDP identifier (spec Section 9.1.1) every advertised endpoint is built from; unset derives it from the request |
+| `access_request.signing_key_file` | string | _(unset)_ | Private JWK (or PEM) used to sign `binding_token`; requires `base_url` and `access_request.audience` |
+| `access_request.audience` | string | _(unset)_ | Access Request Service identifier placed in the `binding_token` `aud` claim |
+| `access_request.denial_ttl` | duration | `10m` | Lifetime given a requestable denial whose policy set no `expires_at` |
+| `access_request.binding_context_members` | array | _(unset)_ | Request `context` members that are authorization-relevant (bound into `binding_token`, compared at approval verification) |
+| `access_request.approval_issuers` | array | _(unset)_ | Trusted `approval.state` signers: `{issuer, jwks_file}` entries; requires `base_url` |
 
 If a `search.*` rule is unset, the corresponding endpoint responds with 501 and is omitted from the PDP metadata (spec Section 9). Each configured rule must be defined in the package given by `path` and return a set/array of entity objects.
 
@@ -263,7 +273,9 @@ When `decision_context` is set, the named rule is evaluated alongside the decisi
 
 The AuthZEN core specification registers no capability URNs of its own (the IANA "AuthZEN Policy Decision Point Capabilities" registry is populated by profiles and vendors), so `capabilities` is operator-supplied. Each entry must be a URN (start with `urn:`); the list is omitted from the metadata when empty. A deployment running the [Access Request and Approval profile](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) advertises `urn:openid:authzen:capability:access-request` here — see [below](#access-request-and-approval-profile).
 
-`signed_metadata` is a JWT that asserts PDP metadata values as claims, signed or MACed with JWS and carrying an `iss` claim (spec Section 9.1.3). A PEP that supports it must prefer the signed values over the plain ones. The plugin holds no key and does not sign it: sign the JWT outside the plugin and paste the compact serialization into the config. At startup the plugin rejects a value that is not a three-part base64url JWS on one line, has no signature, has a missing or `none` `alg`, has a missing or empty `iss`, or contains a `signed_metadata` claim. It also rejects claims that disagree with the config: `capabilities` and `supported_obligations` must be string arrays holding the configured values, `access_request_endpoint` and `jwks_uri` must be the configured strings, and a `search_*_endpoint` claim must be a string and requires that search to be configured. The signature itself is not verified. Endpoint URLs in the plain document are built from the request's `Host` and `X-Forwarded-*` headers, so a PEP that needs them pinned should read them from the signed claims.
+`signed_metadata` is a JWT that asserts PDP metadata values as claims, signed or MACed with JWS and carrying an `iss` claim (spec Section 9.1.3). A PEP that supports it must prefer the signed values over the plain ones. The plugin holds no key and does not sign it: sign the JWT outside the plugin and paste the compact serialization into the config. At startup the plugin rejects a value that is not a three-part base64url JWS on one line, has no signature, has a missing or `none` `alg`, has a missing or empty `iss`, or contains a `signed_metadata` claim. It also rejects claims that disagree with the config: `capabilities` and `supported_obligations` must be string arrays holding the configured values, `access_request_endpoint` and `jwks_uri` must be the configured strings, and a `search_*_endpoint` claim must be a string and requires that search to be configured. The signature itself is not verified.
+
+Endpoint URLs in the metadata are built from `base_url` when it is set. Otherwise they are rebuilt from the request as the client reached it: the first `X-Forwarded-Proto` and `X-Forwarded-Host` values a reverse proxy set, falling back to the request's own scheme and `Host` (a malformed forwarded host is ignored). Those headers are trusted, so a PDP not behind a proxy that overwrites them should set `base_url`; the spec requires a PEP to discard metadata whose `policy_decision_point` differs from the URL it fetched it from.
 
 ### Obligations Profile
 
@@ -295,7 +307,9 @@ obligations_ctx := {"obligations": [{
 }
 ```
 
-Leaving `supported_obligations` unset means the PDP does not implement the profile: the metadata member is omitted and request context reaches the policy untouched. If your policy already reads `input.context.supported_obligations` for its own purposes, note that opting in changes what it sees.
+Once `supported_obligations` is set, the plugin also checks every obligation a policy returns — in the Decision `context` and in the `obligations` member of an individual Search result — against the profile's Obligation object: an array of objects, each with a non-empty `id` unique within the array, a `type` from `supported_obligations`, and a `properties` object. The Normative Obligation Types are checked for their required members: `step-up` needs a string `acr_value` (and `amr_values`, if present, must be a string array); `notification` needs a non-empty array of unique strings in `to` and a string `body` (`topic`, if present, a string); `session_termination` needs a string `subject`. Other types, `custom` included, are checked only for the common shape. A violation is a policy-authoring error and fails the request with 500, rather than reaching a PEP that the profile obliges to turn the decision into a denial anyway. A Search result may carry its own `obligations`; per the profile, the PEP excludes only the results it cannot comply with.
+
+Leaving `supported_obligations` unset means the PDP does not implement the profile: the metadata member is omitted, request context reaches the policy untouched, and the Decision context is not checked. If your policy already reads `input.context.supported_obligations` for its own purposes, note that opting in changes what it sees.
 
 The plugin paginates over the **entire** result set returned by the Rego rule, sorting by the entity's `type`+`id` (or `name` for actions) so page boundaries are stable across requests. If your search rules can return very large candidate sets (tens of thousands), prefer filtering inside Rego rather than relying on the plugin's per-page slicing — the rule still runs once per page request, so heavy candidate sets are paid for every call.
 
@@ -303,7 +317,7 @@ The plugin paginates over the **entire** result set returned by the Rego rule, s
 
 The [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) turns a denial into something a PEP can act on: the PDP marks a denial as _requestable_, and the PEP submits an access request that a human or workflow can approve.
 
-**This plugin implements the PDP discovery half of the profile, not the Access Request Service.** That split is one the profile itself allows — the Access Request Endpoint "MAY be hosted by the PDP itself, by a service trusted by the PDP, or by an independent service operating with delegated authority from the PDP". The endpoint, the Task Status Endpoint, and the approval workflow behind them are stateful, OAuth-protected services; this plugin advertises where they live and lets your policy emit the requestable-denial hint.
+**This plugin implements the PDP's role in the profile, not the Access Request Service.** That split is one the profile itself allows — the Access Request Endpoint "MAY be hosted by the PDP itself, by a service trusted by the PDP, or by an independent service operating with delegated authority from the PDP". The endpoint, the Task Status Endpoint, and the approval workflow behind them are stateful, OAuth-protected services; this plugin advertises where they live, completes and signs the requestable denials your policy emits, and verifies the approvals a PEP brings back.
 
 Two config keys feed the PDP metadata document:
 
@@ -317,27 +331,69 @@ plugins:
       - "urn:openid:authzen:capability:access-request"
 ```
 
-Both must be `https://` URIs with a host; a bad value fails at startup rather than being published to every PEP that reads the metadata. Both are unset by default and omitted from the metadata when unset — and the absence of `access_request_endpoint` is exactly how a PEP learns this PDP advertises no Access Request Endpoint. `jwks_uri` is only needed when the deployment issues signed values under the profile, such as a JWS `binding_token`, so it can be left unset while the endpoint is advertised — but see the binding forms below: a deployment whose Access Request Service is independent of the PDP has to issue that token, and therefore has to publish the key.
+Both must be `https://` URIs with a host; a bad value fails at startup rather than being published to every PEP that reads the metadata. Both are unset by default and omitted from the metadata when unset — and the absence of `access_request_endpoint` is exactly how a PEP learns this PDP advertises no Access Request Endpoint. When the plugin holds keys of its own (below) and `jwks_uri` is unset, it serves them at `GET /access/v1/jwks` and advertises `<base_url>/access/v1/jwks`.
 
-The requestable-denial hint itself is policy output, carried by the existing `decision_context` rule. The example below binds the denial by reference, so it assumes the shared-state topology described under the binding forms: something outside the plugin must record what the Access Request Service will later resolve from `evaluation_id`, since a stateless OPA records nothing.
+#### Requestable denials
+
+The hint itself is policy output, carried by the existing `decision_context` rule. A policy only needs to say that a denial is requestable and how:
 
 ```rego
 package authzen
 
 denial_ctx := {
     "reason": "approval_required",
-    "evaluation_id": input.context.request_id,
-    "access_request": {
-        "template": "manager_approval",
-        "expires_at": "2026-09-02T20:25:00Z",
-    },
+    "access_request": {"template": "manager_approval"},
 } if {
     not allow
     input.resource.properties.sensitivity == "high"
 }
 ```
 
-The profile requires `expires_at` on every requestable denial, and requires denial-binding material in at least one of two forms, and which form is available to you depends on your topology. A stable `evaluation_id` binds _by reference_ and applies only where the Access Request Service resolves it against state shared with, or delegated by, the PDP; a signed `binding_token` binds _by value_ and works in any topology. Where the Access Request Service is independent of the PDP, the profile requires the `binding_token` form and requires that token to be self-contained — carrying the denied Subject, Resource, Action, and authorization-relevant Context inline or as a `binding_hash` — because a stateless PDP keeps no decision state for an independent service to fetch. A `binding_token` carrying only an `evaluation_id` does not satisfy that requirement. Emitting both forms is allowed and is worth doing: the profile still recommends a stable `context.evaluation_id`, and when a `binding_token` is present that identifier stops being a binding form and serves as a correlation and audit identifier instead. Both values come from your policy or a PDP-side signer; the plugin passes the `decision_context` object through unchanged and does not synthesize, sign, or validate them, so a deployment that needs the `binding_token` form must sign it outside the plugin and publish the verification key at `jwks_uri`. Emit `context.access_request` **only** when an Access Request Endpoint is actually able to process the request — the profile makes the presence of that object the sole signal that a denial is requestable.
+The plugin then applies the PDP's rules from "Issue a Requestable Denial" to whatever `context.access_request` the rule returned:
+
+- **Placement.** A requestable denial is a denial: `access_request` returned with a permit is dropped. It is also dropped when no Access Request Endpoint is available — neither `access_request_endpoint` is configured nor the hint names its own `endpoint` — because the profile makes the object's presence the sole signal that a denial can be requested. Both cases are logged as warnings.
+- **`expires_at`** is REQUIRED. When the policy omits it, the plugin sets it `access_request.denial_ttl` (default 10 minutes) from now. A value that is not RFC 3339 or is already past fails the request.
+- **`evaluation_id` and `evaluated_at`.** The plugin adds a stable `context.evaluation_id` (a UUIDv7, `eval_…`) and `context.evaluated_at` unless the policy supplied them, so every requestable denial carries at least by-reference binding material.
+- **`binding_token`.** With `access_request.signing_key_file` set, the plugin signs a self-contained JWS `binding_token` (unless the policy supplied one) with the claims the profile recommends: `iss` (`base_url`), `aud` (`access_request.audience`), `iat`, `exp` (the hint's `expires_at`), `jti`, `denial_expires_at`, `evaluation_id`, `binding_context_members`, and the denied `subject` (without `properties.act`), `resource`, `action` and authorization-relevant `context` inline. This is the form the profile requires when the Access Request Service is independent of the PDP; without a signing key, `evaluation_id` binds by reference and only works where the service resolves it against state shared with the PDP.
+- **`next_action` and `retry_after`.** On a denial, `next_action` must be a string, and `"request"` requires a `context.access_request` alongside it (the PDP MUST include a fresh one); `retry_after` must be a non-negative integer. A violation fails the request.
+
+```yaml
+plugins:
+  authzen:
+    decision_context: denial_ctx
+    base_url: "https://pdp.example.com"
+    access_request_endpoint: "https://requests.example.com/access/v1/requests"
+    capabilities:
+      - "urn:openid:authzen:capability:access-request"
+    access_request:
+      signing_key_file: /etc/authzen/pdp-signing.jwk   # private JWK naming its "alg"
+      audience: "https://requests.example.com"
+      denial_ttl: 10m
+      binding_context_members: ["project"]
+```
+
+`binding_context_members` names the request `context` members that are authorization-relevant. The profile's own members (`access_request`, `evaluation_id`, `evaluated_at`, `reason`, `approval`) cannot be listed, and volatile members such as `time` should not be, or a later submission will never compare equal.
+
+#### Approval verification
+
+When a PEP re-evaluates after approval it carries the Approval Result at `context.approval`. With `access_request.approval_issuers` set, the plugin verifies it **before any rule runs** and replaces it with what it could establish, so a policy never reads a PEP-asserted value:
+
+```yaml
+    access_request:
+      approval_issuers:
+        - issuer: "https://requests.example.com"
+          jwks_file: /etc/authzen/ars-jwks.json   # public keys, each with kid and alg
+```
+
+The `approval.state` must be a compact JWS signed by a configured issuer's key and carry `iss`, an `aud` naming `base_url`, `approval_id` equal to `approval.id`, `approved_until` (RFC 3339, not past, with 30 seconds of clock skew), and the approved `subject`, `resource`, `action` and, for the members listed in `binding_context_members`, `context` — compared with the current request under the profile's exact-match approval scope (`subject.properties.act` excluded). The policy then sees one of:
+
+```json
+{"id": "apr_1", "verified": true, "issuer": "https://requests.example.com",
+ "approved_until": "2026-05-01T00:42:00Z", "approved_at": "...", "task_id": "..."}
+{"id": "apr_1", "verified": false, "reason": "approval_unverifiable" | "approval_expired" | "out_of_scope"}
+```
+
+The `reason` values are the profile's re-evaluation denial reasons, so a policy can return them with a matching `next_action`. The trusted issuers' keys are published in the PDP's JWK Set, which the profile treats as the PDP's statement that it trusts them. A signed state cannot convey later revocation or cancellation, which the profile also requires checking; do that in policy, keyed by the verified `id`. Without `approval_issuers`, `context.approval` reaches the policy unchanged, for deployments that resolve `approval.id` from shared state.
 
 ### Decision logs
 
@@ -431,6 +487,12 @@ Action Search (spec Section 8.6). Requires `search.action`. Request omits the `a
 
 PDP metadata discovery endpoint (Section 9).
 
+### `GET /access/v1/jwks`
+
+JWK Set (`application/jwk-set+json`) of the public `binding_token` signing key and the trusted `approval.state` signer keys, served when `access_request.signing_key_file` or `access_request.approval_issuers` is configured; 404 otherwise.
+
 ## License
 
 Apache License 2.0. See [LICENSE](./LICENSE).
+
+This is a fork of [kanywst/opa-authzen-plugin](https://github.com/kanywst/opa-authzen-plugin) maintained by Tracefort. Files changed in the fork are listed in [NOTICE](./NOTICE).

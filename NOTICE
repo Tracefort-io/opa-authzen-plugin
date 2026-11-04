@@ -1,0 +1,22 @@
+opa-authzen-plugin
+Copyright the opa-authzen-plugin authors (https://github.com/kanywst/opa-authzen-plugin)
+Licensed under the Apache License, Version 2.0; see LICENSE.
+
+This fork is maintained by Tracefort (https://github.com/Tracefort-io/opa-authzen-plugin).
+Modifications Copyright 2026 Tracefort, licensed under the same terms.
+
+Files modified in this fork:
+  README.md
+  go.mod
+  CHANGELOG.md
+  example/config.yaml
+  internal/internal.go
+  interop/todo/policy/authzen.rego
+  interop/todo/policy/authzen_test.rego
+  interop/todo/scripts/test-local.sh
+
+Files added in this fork:
+  NOTICE
+  internal/access_request.go
+  internal/obligations.go
+  internal/profiles_test.go

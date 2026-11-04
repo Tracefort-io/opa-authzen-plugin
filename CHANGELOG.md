@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Changes in the Tracefort fork. Nothing changes for a deployment that sets none of the new options, except where noted under Fixed.
+
+### Added
+
+- `base_url` config option: pins the Policy Decision Point identifier (spec Section 9.1.1) every endpoint in the metadata document is built from. Must be an http(s) URL with a host and no query or fragment.
+- Obligations Profile: with `supported_obligations` set, every obligation a policy returns — in the Decision `context` and in the `obligations` member of an individual Search result — is checked against the Obligation object (unique non-empty `id`, an advertised `type`, a `properties` object) and the required members of the Normative Obligation Types (`step-up`, `notification`, `session_termination`). A violation fails the request with 500.
+- Access Request and Approval Profile, requestable-denial issuance: a `context.access_request` returned with a permit, or with no Access Request Endpoint available, is dropped; `expires_at` is supplied when absent (`access_request.denial_ttl`, default 10m) and rejected when malformed or past; `context.evaluation_id` (UUIDv7) and `context.evaluated_at` are added unless the policy set them; on a denial, `next_action: "request"` requires an `access_request` and `retry_after` must be a non-negative integer.
+- `access_request.signing_key_file` and `access_request.audience`: the plugin signs a self-contained JWS `binding_token` carrying the denied subject (without `properties.act`), resource, action and `access_request.binding_context_members` inline.
+- `access_request.approval_issuers`: a PEP's `context.approval` is verified (signature by a trusted issuer, `aud` naming `base_url`, `approval_id`, `approved_until`, exact-match scope) and replaced before any rule runs with `{"verified": true, ...}` or `{"verified": false, "reason": ...}` using the profile's re-evaluation denial reasons.
+- `GET /access/v1/jwks`: serves the binding_token signing key and the trusted approval signers' keys, advertised as `jwks_uri` when that is not configured.
+
+### Fixed
+
+- The metadata document ignored `X-Forwarded-Host` whenever the request carried a `Host` header, which is always, so a PDP behind a proxy advertised its internal address. The first `X-Forwarded-Host` and `X-Forwarded-Proto` values now win; a malformed forwarded host falls back to `Host`.
+- The interop Todo policy's `notification` obligation used `recipient`/`event`/`actor` properties; it now uses the profile's `to`, `body` and `topic`, and adds a `context.decision_subject` to `to` as the profile recommends.
+
 ## [v0.12.0] - 2026-11-04
 
 AuthZEN decisions now reach OPA's decision log. No configuration change is needed to upgrade.
