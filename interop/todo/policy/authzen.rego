@@ -1,3 +1,5 @@
+# Modified by Tracefort (2026) from kanywst/opa-authzen-plugin; see NOTICE.
+
 package authzen
 
 import rego.v1
@@ -172,15 +174,28 @@ obligation_context := {"obligations": [{
 	"id": sprintf("notify-owner-%s", [input.resource.id]),
 	"type": "notification",
 	"properties": {
-		"recipient": input.resource.properties.ownerID,
-		"event": input.action.name,
-		"actor": user.email,
+		"to": notification_recipients,
+		"topic": "Todo changed by another user",
+		"body": sprintf("%s performed %s on todo %s.", [user.email, input.action.name, input.resource.id]),
 	},
 }]} if {
 	allow
 	input.action.name in {"can_update_todo", "can_delete_todo"}
 	input.resource.properties.ownerID != user.email
 	"notification" in input.context.supported_obligations
+}
+
+# The profile's `notification` type carries its destinations in `to`. When the
+# PEP names the entity the request pertains to as `context.decision_subject`,
+# the PDP SHOULD notify it as well; it is added once, after the owner.
+notification_recipients := [input.resource.properties.ownerID] if not extra_decision_subject
+
+notification_recipients := [input.resource.properties.ownerID, input.context.decision_subject] if extra_decision_subject
+
+extra_decision_subject if {
+	is_string(input.context.decision_subject)
+	input.context.decision_subject != ""
+	input.context.decision_subject != input.resource.properties.ownerID
 }
 
 # Echoes what survived that filter, which is otherwise unobservable over HTTP

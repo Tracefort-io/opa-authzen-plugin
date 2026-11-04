@@ -1,3 +1,5 @@
+# Modified by Tracefort (2026) from kanywst/opa-authzen-plugin; see NOTICE.
+
 package authzen_test
 
 import rego.v1
@@ -404,11 +406,48 @@ test_notification_obligation_on_privileged_cross_owner_update if {
 		"id": sprintf("notify-owner-%s", [morty_todo]),
 		"type": "notification",
 		"properties": {
-			"recipient": "morty@the-citadel.com",
-			"event": "can_update_todo",
-			"actor": "rick@the-citadel.com",
+			"to": ["morty@the-citadel.com"],
+			"topic": "Todo changed by another user",
+			"body": sprintf("rick@the-citadel.com performed can_update_todo on todo %s.", [morty_todo]),
 		},
 	}]
+}
+
+# The PEP named a decision subject: it is notified alongside the owner.
+test_notification_includes_decision_subject if {
+	ctx := authzen.decision_context with input as {
+		"subject": {"type": "user", "id": rick_pid},
+		"action": {"name": "can_delete_todo"},
+		"resource": {
+			"type": "todo",
+			"id": morty_todo,
+			"properties": {"ownerID": "morty@the-citadel.com"},
+		},
+		"context": {
+			"supported_obligations": ["notification"],
+			"decision_subject": "audit@the-citadel.com",
+		},
+	}
+	ctx.obligations[0].properties.to == ["morty@the-citadel.com", "audit@the-citadel.com"]
+}
+
+# A decision subject that is the owner is not listed twice; `to` entries
+# must be unique.
+test_notification_decision_subject_not_duplicated if {
+	ctx := authzen.decision_context with input as {
+		"subject": {"type": "user", "id": rick_pid},
+		"action": {"name": "can_delete_todo"},
+		"resource": {
+			"type": "todo",
+			"id": morty_todo,
+			"properties": {"ownerID": "morty@the-citadel.com"},
+		},
+		"context": {
+			"supported_obligations": ["notification"],
+			"decision_subject": "morty@the-citadel.com",
+		},
+	}
+	ctx.obligations[0].properties.to == ["morty@the-citadel.com"]
 }
 
 # Same request, but the PEP declared nothing. The profile's negotiation rule

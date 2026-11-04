@@ -1,4 +1,5 @@
 #!/bin/bash
+# Modified by Tracefort (2026) from kanywst/opa-authzen-plugin; see NOTICE.
 # Local test script: end-to-end AuthZEN conformance checks against the PDP
 # Usage: ./scripts/test-local.sh [pdp-url]
 #
@@ -480,7 +481,7 @@ test_decision_context "context/reason on unknown subject" \
 # declared it can execute `notification`, so the owner must be notified.
 test_decision_context "obligations/notification issued on cross-owner update" \
   '{"subject":{"type":"user","id":"'"$RICK"'"},"action":{"name":"can_update_todo"},"resource":{"type":"todo","id":"'"$MORTY_TODO"'","properties":{"ownerID":"morty@the-citadel.com"}},"context":{"supported_obligations":["notification"]}}' \
-  '{"reason":"permitted","negotiated_obligations":["notification"],"obligations":[{"id":"notify-owner-'"$MORTY_TODO"'","type":"notification","properties":{"recipient":"morty@the-citadel.com","event":"can_update_todo","actor":"rick@the-citadel.com"}}]}'
+  '{"reason":"permitted","negotiated_obligations":["notification"],"obligations":[{"id":"notify-owner-'"$MORTY_TODO"'","type":"notification","properties":{"to":["morty@the-citadel.com"],"topic":"Todo changed by another user","body":"rick@the-citadel.com performed can_update_todo on todo '"$MORTY_TODO"'."}}]}'
 
 # PEP silent: no obligation, and an absent member stays absent rather than
 # becoming an empty array.
@@ -493,7 +494,7 @@ test_decision_context "obligations/none when PEP declares nothing" \
 # PDP, which echoes carrier-pigeon back.
 test_decision_context "obligations/unadvertised type filtered out" \
   '{"subject":{"type":"user","id":"'"$RICK"'"},"action":{"name":"can_update_todo"},"resource":{"type":"todo","id":"'"$MORTY_TODO"'","properties":{"ownerID":"morty@the-citadel.com"}},"context":{"supported_obligations":["notification","carrier-pigeon"]}}' \
-  '{"reason":"permitted","negotiated_obligations":["notification"],"obligations":[{"id":"notify-owner-'"$MORTY_TODO"'","type":"notification","properties":{"recipient":"morty@the-citadel.com","event":"can_update_todo","actor":"rick@the-citadel.com"}}]}'
+  '{"reason":"permitted","negotiated_obligations":["notification"],"obligations":[{"id":"notify-owner-'"$MORTY_TODO"'","type":"notification","properties":{"to":["morty@the-citadel.com"],"topic":"Todo changed by another user","body":"rick@the-citadel.com performed can_update_todo on todo '"$MORTY_TODO"'."}}]}'
 
 # `step-up` is a registered type but not advertised here, so it filters down
 # to an empty array, which the profile keeps rather than deletes.
