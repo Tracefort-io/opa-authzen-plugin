@@ -96,6 +96,8 @@ type AccessRequestConfig struct {
 	// `approval.state` must name. Empty leaves `context.approval` to the
 	// policy, for deployments that resolve `approval.id` from shared state.
 	ApprovalIssuers []ApprovalIssuer `json:"approval_issuers,omitempty"`
+	// Service hosts the Access Request Service in the plugin.
+	Service ServiceConfig `json:"service,omitempty"`
 
 	signingKey jwk.Key
 	signingAlg jwa.SignatureAlgorithm
@@ -218,7 +220,7 @@ func (a *AccessRequestConfig) load(cfg *Config) error {
 			cfg.JWKSURI = cfg.BaseURL + jwksPath
 		}
 	}
-	return nil
+	return a.Service.load(cfg, a)
 }
 
 // loadSigningKey reads the PDP's private signing key.
