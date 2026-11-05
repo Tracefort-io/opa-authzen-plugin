@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Tracefort-io/opa-authzen-plugin/internal/ars"
+	"github.com/Tracefort-io/opa-authzen-plugin/internal/ars/store"
 	"github.com/open-policy-agent/opa/v1/logging"
 	"github.com/open-policy-agent/opa/v1/plugins"
 	"github.com/open-policy-agent/opa/v1/rego"
@@ -419,25 +421,41 @@ type AuthZenPlugin struct {
 	// now is the clock used for requestable-denial and approval timestamps;
 	// tests replace it.
 	now func() time.Time
+
+	// The hosted Access Request Service, when access_request.service is
+	// enabled: set by Start, cleared by Stop. See service.go.
+	arsService *ars.Service
+	arsStore   store.Store
+	arsCancel  context.CancelFunc
+	// openStore opens the service's store; tests replace it.
+	openStore func(ctx context.Context, s *ServiceConfig) (store.Store, error)
 }
 
 // New creates a new AuthZenPlugin.
 func New(m *plugins.Manager, cfg *Config) *AuthZenPlugin {
 	return &AuthZenPlugin{
-		manager: m,
-		cfg:     *cfg,
-		logger:  m.Logger().WithFields(map[string]any{"plugin": PluginName}),
-		now:     time.Now,
+		manager:   m,
+		cfg:       *cfg,
+		logger:    m.Logger().WithFields(map[string]any{"plugin": PluginName}),
+		now:       time.Now,
+		openStore: openPostgres,
 	}
 }
 
-// Start registers the AuthZEN routes on OPA's HTTP server via ExtraRoute.
-func (p *AuthZenPlugin) Start(_ context.Context) error {
+// Start registers the AuthZEN routes on OPA's HTTP server via ExtraRoute,
+// and starts the Access Request Service when it is enabled.
+func (p *AuthZenPlugin) Start(ctx context.Context) error {
 	p.mu.Lock()
 	alreadyStarted := p.started
 	p.started = true
 	p.stopped = false
+	serviceEnabled := p.cfg.AccessRequest.Service.Enabled
 	p.mu.Unlock()
+
+	if err := p.startService(ctx); err != nil {
+		p.manager.UpdatePluginStatus(PluginName, &plugins.Status{State: plugins.StateErr, Message: err.Error()})
+		return err
+	}
 
 	if !alreadyStarted {
 		p.logger.Info("Starting AuthZEN plugin")
@@ -448,6 +466,9 @@ func (p *AuthZenPlugin) Start(_ context.Context) error {
 		p.manager.ExtraRoute("POST /access/v1/search/action", "authzen/search-action", p.handleActionSearch)
 		p.manager.ExtraRoute("GET /.well-known/authzen-configuration", "authzen/well-known", p.handleWellKnown)
 		p.manager.ExtraRoute("GET "+jwksPath, "authzen/jwks", p.handleJWKS)
+		if serviceEnabled {
+			p.registerServiceRoutes()
+		}
 	}
 
 	p.manager.UpdatePluginStatus(PluginName, &plugins.Status{State: plugins.StateOK})
@@ -461,6 +482,7 @@ func (p *AuthZenPlugin) Stop(_ context.Context) {
 	p.mu.Lock()
 	p.stopped = true
 	p.mu.Unlock()
+	p.stopService()
 	p.manager.UpdatePluginStatus(PluginName, &plugins.Status{State: plugins.StateNotReady})
 }
 
@@ -473,6 +495,11 @@ func (p *AuthZenPlugin) Reconfigure(_ context.Context, config any) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// The running Access Request Service keeps the store and routes it
+	// started with; changing them needs a restart.
+	if cfg.AccessRequest.Service.Enabled != (p.arsService != nil) {
+		p.logger.Warn("AuthZEN reconfigure: access_request.service changes take effect after a restart")
+	}
 	p.cfg = *cfg
 }
 
@@ -936,7 +963,11 @@ func (p *AuthZenPlugin) handleEvaluation(w http.ResponseWriter, r *http.Request)
 
 	snap := p.configSnapshot()
 	path, decisionRule := snap.path, snap.decision
-	p.prepareInput(input, &snap)
+	if err := p.prepareInput(r.Context(), input, &snap); err != nil {
+		p.logger.WithFields(map[string]any{"error": err}).Error("AuthZEN evaluation: approval verification failed")
+		jsonError(w, "evaluation failed", http.StatusInternalServerError)
+		return
+	}
 	ev := p.newDecisionLog(r, txn, path, decisionRule).begin()
 
 	decision, err := p.evalDecision(r.Context(), txn, input, path, decisionRule, ev.regoOptions()...)
@@ -995,6 +1026,7 @@ func (p *AuthZenPlugin) configSnapshot() evalConfig {
 		accessRequestEndpoint: p.cfg.AccessRequestEndpoint,
 		baseURL:               p.cfg.BaseURL,
 		accessRequest:         p.cfg.AccessRequest,
+		approvals:             p.arsStore,
 	}
 }
 
@@ -1005,15 +1037,19 @@ type evalConfig struct {
 	accessRequestEndpoint       string
 	baseURL                     string
 	accessRequest               AccessRequestConfig
+	// approvals is the hosted Access Request Service's store, or nil.
+	approvals store.Store
 }
 
 // prepareInput applies the profile processing that runs on a validated input
 // before any rule sees it: obligation negotiation (Obligations Profile) and,
 // when configured, approval verification (Access Request and Approval
 // Profile).
-func (p *AuthZenPlugin) prepareInput(input map[string]any, snap *evalConfig) {
+//
+// It fails only when approval state cannot be read, which fails the request.
+func (p *AuthZenPlugin) prepareInput(ctx context.Context, input map[string]any, snap *evalConfig) error {
 	applyObligationNegotiation(input, snap.obligations)
-	p.verifyApproval(input, snap)
+	return p.verifyApproval(ctx, input, snap)
 }
 
 // evalDecisionContext evaluates the configured decision-context rule (if any)
@@ -1149,7 +1185,11 @@ func (p *AuthZenPlugin) handleEvaluations(w http.ResponseWriter, r *http.Request
 
 		snap := p.configSnapshot()
 		path, decisionRule := snap.path, snap.decision
-		p.prepareInput(input, &snap)
+		if err := p.prepareInput(r.Context(), input, &snap); err != nil {
+			p.logger.WithFields(map[string]any{"error": err}).Error("AuthZEN evaluation: approval verification failed")
+			jsonError(w, "evaluation failed", http.StatusInternalServerError)
+			return
+		}
 		ev := p.newDecisionLog(r, txn, path, decisionRule).begin()
 		decision, err := p.evalDecision(r.Context(), txn, input, path, decisionRule, ev.regoOptions()...)
 		if err != nil {
@@ -1235,7 +1275,14 @@ func (p *AuthZenPlugin) handleEvaluations(w http.ResponseWriter, r *http.Request
 			}
 			continue
 		}
-		p.prepareInput(input, &snap)
+		if err := p.prepareInput(r.Context(), input, &snap); err != nil {
+			p.logger.WithFields(map[string]any{"error": err}).Error("AuthZEN batch evaluation: approval verification failed")
+			results = append(results, evalErrorResponse(500, "evaluation failed"))
+			if semantic == semanticDenyOnFirstDeny {
+				break
+			}
+			continue
+		}
 		ev := dl.begin()
 
 		decision, err := p.evalDecision(r.Context(), txn, input, path, decisionRule, ev.regoOptions()...)

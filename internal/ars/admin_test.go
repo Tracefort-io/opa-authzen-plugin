@@ -169,3 +169,20 @@ func TestApproverMatchesIssuer(t *testing.T) {
 		t.Fatal("only user candidates match an approver")
 	}
 }
+
+func TestSweeperExpiresDueTasks(t *testing.T) {
+	f := newFixture(t)
+	id := f.submitPending(t, "j1")
+	f.svc.d.Now = func() time.Time { return now.Add(73 * time.Hour) }
+	f.svc.sweep(context.Background())
+	got, _ := f.store.GetTask(context.Background(), id)
+	if got.Status != "expired" || got.Items[0].Status != "expired" {
+		t.Fatalf("task not expired: %+v", got)
+	}
+	if f.audit.events[len(f.audit.events)-1] != "expired" {
+		t.Fatalf("audit: %v", f.audit.events)
+	}
+	if w := f.do(t, http.MethodPost, AdminPath+"/tasks/"+id+"/decisions", f.approverToken(t, "manager"), map[string]any{"decision": "approve"}); w.Code != http.StatusConflict {
+		t.Fatalf("approving an expired task: %d", w.Code)
+	}
+}

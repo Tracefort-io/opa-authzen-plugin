@@ -543,3 +543,10 @@ func (p *Postgres) ExpireDue(ctx context.Context, now time.Time, limit int) ([]s
 	sort.Strings(ids)
 	return ids, nil
 }
+
+// DropSchemaForTest drops schema and everything in it. Tests only.
+func (p *Postgres) DropSchemaForTest(ctx context.Context, schema string) {
+	if schemaName.MatchString(schema) {
+		_, _ = p.pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+schema+" CASCADE")
+	}
+}

@@ -1,17 +1,19 @@
 package internal
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
-	"reflect"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/Tracefort-io/opa-authzen-plugin/internal/ars"
+	"github.com/Tracefort-io/opa-authzen-plugin/internal/ars/store"
 	"github.com/google/uuid"
 	"github.com/lestrrat-go/jwx/v3/jwa"
 	"github.com/lestrrat-go/jwx/v3/jwk"
@@ -470,10 +472,10 @@ func signBindingToken(ac *AccessRequestConfig, issuer string, input map[string]a
 		"denial_expires_at":       expiresAt,
 		"evaluation_id":           evalID,
 		"binding_context_members": members,
-		"subject":                 withoutActor(input["subject"]),
+		"subject":                 ars.WithoutActor(input["subject"]),
 		"resource":                input["resource"],
 		"action":                  input["action"],
-		"context":                 relevantContext(input, members),
+		"context":                 ars.RelevantContext(requestContext(input), members),
 	}
 	payload, err := json.Marshal(claims)
 	if err != nil {
@@ -491,46 +493,6 @@ func signBindingToken(ac *AccessRequestConfig, issuer string, input map[string]a
 		return "", err
 	}
 	return string(out), nil
-}
-
-// withoutActor copies an AuthZEN Subject without `properties.act`, which the
-// profile excludes from every binding comparison because a PEP may move the
-// actor to `client.actor` ("Structural Comparison").
-func withoutActor(v any) any {
-	subject, ok := v.(map[string]any)
-	if !ok {
-		return v
-	}
-	out := make(map[string]any, len(subject))
-	for k, val := range subject {
-		out[k] = val
-	}
-	if props, ok := subject["properties"].(map[string]any); ok {
-		if _, has := props["act"]; has {
-			copied := make(map[string]any, len(props))
-			for k, val := range props {
-				if k != "act" {
-					copied[k] = val
-				}
-			}
-			out["properties"] = copied
-		}
-	}
-	return out
-}
-
-// relevantContext returns the authorization-relevant members of the request
-// context: those named in members that are present. An absent member stays
-// absent, which the profile distinguishes from one set to null.
-func relevantContext(input map[string]any, members []string) map[string]any {
-	out := map[string]any{}
-	ctx, _ := input["context"].(map[string]any)
-	for _, m := range members {
-		if v, ok := ctx[m]; ok {
-			out[m] = v
-		}
-	}
-	return out
 }
 
 // validateReevaluationDenial checks the members a PDP uses to direct the PEP
@@ -586,26 +548,123 @@ func nonNegativeInteger(v any) (int64, bool) {
 //	{["id"], "verified": false, "reason": "approval_unverifiable" | "approval_expired" | "out_of_scope"}
 //
 // A PEP cannot assert `verified` itself: the member is always overwritten.
-// What the signed state cannot carry is current status — revocation,
-// cancellation — which the profile also requires checking; a policy does that
+//
+// With the Access Request Service hosted in the plugin, approvals are
+// resolved by `approval.id` in its store, which also answers the current
+// status the profile requires checking: a revoked approval is reported as
+// approval_expired. An approval the store does not hold falls back to the
+// signed approval.state path when approval_issuers is configured. Without
+// the service, a signed state cannot carry revocation, so a policy checks it
 // against its own data, keyed by the verified `id`.
-func (p *AuthZenPlugin) verifyApproval(input map[string]any, snap *evalConfig) {
-	if len(snap.accessRequest.issuers) == 0 {
-		return
+//
+// An error is returned only when the store cannot be read; the evaluation
+// then fails rather than reporting a valid approval as unverifiable.
+func (p *AuthZenPlugin) verifyApproval(ctx context.Context, input map[string]any, snap *evalConfig) error {
+	if len(snap.accessRequest.issuers) == 0 && snap.approvals == nil {
+		return nil
 	}
-	ctx, ok := input["context"].(map[string]any)
-	if !ok {
-		return
-	}
-	raw, present := ctx["approval"]
+	reqCtx := requestContext(input)
+	raw, present := reqCtx["approval"]
 	if !present {
-		return
+		return nil
 	}
-	verified, err := checkApproval(raw, input, snap, p.now().UTC())
+	now := p.now().UTC()
+	var verified map[string]any
+	var aerr *approvalError
+	if snap.approvals != nil {
+		found, v, e, err := lookupApproval(ctx, snap.approvals, raw, input, snap, now)
+		if err != nil {
+			return err
+		}
+		if found {
+			verified, aerr = v, e
+		}
+	}
+	if verified == nil {
+		if len(snap.accessRequest.issuers) > 0 {
+			verified, aerr = checkApproval(raw, input, snap, now)
+		} else {
+			verified, aerr = unverifiable(raw, errors.New("approval is not held by the Access Request Service"))
+		}
+	}
+	if aerr != nil {
+		p.logger.WithFields(map[string]any{"reason": aerr.reason, "error": aerr.err}).Debug("AuthZEN: approval not accepted")
+	}
+	reqCtx["approval"] = verified
+	return nil
+}
+
+// requestContext returns the input's `context` object, or nil.
+func requestContext(input map[string]any) map[string]any {
+	ctx, _ := input["context"].(map[string]any)
+	return ctx
+}
+
+func unverifiable(raw any, err error) (map[string]any, *approvalError) {
+	out := map[string]any{"verified": false, "reason": reasonApprovalUnverifiable}
+	if a, ok := raw.(map[string]any); ok {
+		if id, ok := a["id"].(string); ok && id != "" {
+			out["id"] = id
+		}
+	}
+	return out, &approvalError{reason: reasonApprovalUnverifiable, err: err}
+}
+
+// lookupApproval resolves an approval in the Access Request Service store
+// ("Approval Reference by Lookup", "Current Approval Status", "Approval
+// Scope"). found is false when the store holds no such approval.
+func lookupApproval(ctx context.Context, st store.Store, raw any, input map[string]any, snap *evalConfig, now time.Time) (bool, map[string]any, *approvalError, error) {
+	approval, ok := raw.(map[string]any)
+	if !ok {
+		v, e := unverifiable(raw, errors.New("approval is not an object"))
+		return true, v, e, nil
+	}
+	id, _ := approval["id"].(string)
+	if id == "" {
+		v, e := unverifiable(raw, errors.New("approval.id is missing"))
+		return true, v, e, nil
+	}
+	a, err := st.GetApproval(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil, nil, nil
+	}
 	if err != nil {
-		p.logger.WithFields(map[string]any{"reason": err.reason, "error": err.err}).Debug("AuthZEN: approval not accepted")
+		return false, nil, nil, fmt.Errorf("looking up approval %s: %w", id, err)
 	}
-	ctx["approval"] = verified
+	fail := func(reason string, err error) (bool, map[string]any, *approvalError, error) {
+		return true, map[string]any{"id": id, "verified": false, "reason": reason}, &approvalError{reason: reason, err: err}, nil
+	}
+	if a.RevokedAt != nil {
+		return fail(reasonApprovalExpired, errors.New("approval was revoked"))
+	}
+	if now.After(a.ApprovedUntil.Add(approvalClockSkew)) {
+		return fail(reasonApprovalExpired, errors.New("approved_until has passed"))
+	}
+	switch {
+	case !ars.SameBinding(ars.WithoutActor(a.Subject), ars.WithoutActor(input["subject"])):
+		return fail(reasonOutOfScope, errors.New("subject differs from the approved subject"))
+	case !ars.SameBinding(a.Resource, input["resource"]):
+		return fail(reasonOutOfScope, errors.New("resource differs from the approved resource"))
+	case !ars.SameBinding(a.Action, input["action"]):
+		return fail(reasonOutOfScope, errors.New("action differs from the approved action"))
+	case !ars.SameBinding(nonNil(a.Context), ars.RelevantContext(requestContext(input), a.BindingContextMembers)):
+		return fail(reasonOutOfScope, errors.New("authorization-relevant context differs from the approved context"))
+	}
+	return true, map[string]any{
+		"id":             id,
+		"verified":       true,
+		"issuer":         snap.baseURL,
+		"task_id":        a.TaskID,
+		"approved_at":    a.ApprovedAt.UTC().Format(time.RFC3339),
+		"approved_until": a.ApprovedUntil.UTC().Format(time.RFC3339),
+	}, nil, nil
+}
+
+func nonNil(m map[string]any) map[string]any {
+	if m == nil {
+		return map[string]any{}
+	}
+	return m
 }
 
 // approvalError carries the reason code reported to the policy and the
@@ -692,13 +751,13 @@ func checkApproval(raw any, input map[string]any, snap *evalConfig, now time.Tim
 		boundCtx = map[string]any{}
 	}
 	switch {
-	case !reflect.DeepEqual(withoutActor(claims["subject"]), withoutActor(input["subject"])):
+	case !ars.SameBinding(ars.WithoutActor(claims["subject"]), ars.WithoutActor(input["subject"])):
 		return fail(reasonOutOfScope, errors.New("subject differs from the approved subject"))
-	case !reflect.DeepEqual(claims["resource"], input["resource"]):
+	case !ars.SameBinding(claims["resource"], input["resource"]):
 		return fail(reasonOutOfScope, errors.New("resource differs from the approved resource"))
-	case !reflect.DeepEqual(claims["action"], input["action"]):
+	case !ars.SameBinding(claims["action"], input["action"]):
 		return fail(reasonOutOfScope, errors.New("action differs from the approved action"))
-	case !reflect.DeepEqual(boundCtx, relevantContext(input, members)):
+	case !ars.SameBinding(boundCtx, ars.RelevantContext(requestContext(input), members)):
 		return fail(reasonOutOfScope, errors.New("authorization-relevant context differs from the approved context"))
 	}
 

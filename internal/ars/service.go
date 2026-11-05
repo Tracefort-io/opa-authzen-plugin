@@ -92,7 +92,27 @@ type Deps struct {
 
 // Service serves the Access Request Service and approver APIs.
 type Service struct {
-	d Deps
+	d      Deps
+	routes map[string]http.HandlerFunc
+}
+
+// RoutePatterns lists the ServeMux patterns the service serves, so routes
+// can be registered before a Service exists.
+func RoutePatterns() []string {
+	var s Service
+	out := make([]string, 0, len(s.Routes()))
+	for p := range s.Routes() {
+		out = append(out, p)
+	}
+	return out
+}
+
+// Handler returns the handler for one of RoutePatterns.
+func (s *Service) Handler(pattern string) http.HandlerFunc {
+	if h, ok := s.routes[pattern]; ok {
+		return h
+	}
+	return http.NotFound
 }
 
 // New returns a Service. Unset Audit, Logger and Now get no-op or real
@@ -108,7 +128,9 @@ func New(deps *Deps) *Service {
 	if d.Now == nil {
 		d.Now = time.Now
 	}
-	return &Service{d: d}
+	s := &Service{d: d}
+	s.routes = s.Routes()
+	return s
 }
 
 // Routes returns the handlers of the ARAP endpoints and the approver API,
