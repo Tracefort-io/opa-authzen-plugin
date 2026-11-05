@@ -41,6 +41,15 @@ Files modified in this fork:
 
 Files added in this fork:
   NOTICE
+  docs/design/access-request-service.md
   internal/access_request.go
+  internal/ars/ (Access Request Service, its store and migrations)
+  internal/audit.go
+  internal/audit_test.go
+  internal/authn/
   internal/obligations.go
   internal/profiles_test.go
+  internal/service.go
+  internal/service_config.go
+  internal/service_config_test.go
+  internal/service_test.go

@@ -1,7 +1,6 @@
 # Design: Access Request Service in the plugin
 
-Status: proposed, for review
-Branch: `access-request-service` (builds on `spec-gaps`)
+Status: phase 1 implemented (branch `ars-phase1`); phases 2 and 3 open
 
 ## 1. Summary
 

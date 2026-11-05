@@ -55,3 +55,13 @@ plugins:
     #   approval_issuers:
     #     - issuer: "https://requests.example.com"
     #       jwks_file: /etc/authzen/ars-jwks.json
+    #   # Host the Access Request Service in the plugin (README: "Hosted
+    #   # Access Request Service"). Needs base_url, signing_key_file, a
+    #   # Postgres DSN in AUTHZEN_ARS_DSN, token issuers and three rules.
+    #   service:
+    #     enabled: true
+    #     caller_auth:
+    #       issuers: [{issuer: "https://idp.example.com", audience: "https://pdp.example.com", jwks_uri: "https://idp.example.com/.well-known/jwks.json"}]
+    #     approver_auth:
+    #       issuers: [{issuer: "https://idp.example.com", audience: "authzen-approver-api", jwks_uri: "https://idp.example.com/.well-known/jwks.json"}]
+    #     rules: {caller: ars_caller, workflow: ars_workflow, approver: ars_approver}

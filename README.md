@@ -68,7 +68,7 @@ The plugin registers AuthZEN endpoints directly on OPA's own HTTP server (`:8181
 | [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | PDP discovery: `access_request_endpoint`, `jwks_uri`, capability URN | ✅ Supported (opt-in) — see [below](#access-request-and-approval-profile) |
 | [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | Requestable-denial issuance: placement rules, `expires_at`, `evaluation_id`, signed `binding_token`, served JWK Set | ✅ Supported (opt-in) |
 | [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | Approval verification at re-evaluation (`approval.state`, exact-match scope) | ✅ Supported (opt-in via `access_request.approval_issuers`) |
-| [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | Access Request / Task Status endpoints, approval workflow | ❌ Not implemented — the profile permits a separate service to host these |
+| [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | Access Request Service: submission, Task Status, cancellation, single-step approval with quorum, revocation (Postgres) | ✅ Supported (opt-in via `access_request.service`) — single-item requests; bulk, callbacks and actor verification are not yet supported |
 
 The Authorization API itself is final at 1.0. The two profiles are not: both are titled **Draft 1** upstream, and the `1_0` in their filenames and URLs is the document name, not a released version. Support for them is opt-in and their normative text can still move — the denial-binding rules in the Access Request and Approval profile changed in September 2026, after this plugin shipped support for its discovery members.
 
@@ -266,6 +266,7 @@ The plugin is configured under the `plugins.authzen` key in the OPA config file:
 | `access_request.denial_ttl` | duration | `10m` | Lifetime given a requestable denial whose policy set no `expires_at` |
 | `access_request.binding_context_members` | array | _(unset)_ | Request `context` members that are authorization-relevant (bound into `binding_token`, compared at approval verification) |
 | `access_request.approval_issuers` | array | _(unset)_ | Trusted `approval.state` signers: `{issuer, jwks_file}` entries; requires `base_url` |
+| `access_request.service.*` | object | _(disabled)_ | Hosts the Access Request Service in the plugin, backed by Postgres; see [Hosted Access Request Service](#hosted-access-request-service) |
 
 If a `search.*` rule is unset, the corresponding endpoint responds with 501 and is omitted from the PDP metadata (spec Section 9). Each configured rule must be defined in the package given by `path` and return a set/array of entity objects.
 
@@ -317,7 +318,7 @@ The plugin paginates over the **entire** result set returned by the Rego rule, s
 
 The [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) turns a denial into something a PEP can act on: the PDP marks a denial as _requestable_, and the PEP submits an access request that a human or workflow can approve.
 
-**This plugin implements the PDP's role in the profile, not the Access Request Service.** That split is one the profile itself allows — the Access Request Endpoint "MAY be hosted by the PDP itself, by a service trusted by the PDP, or by an independent service operating with delegated authority from the PDP". The endpoint, the Task Status Endpoint, and the approval workflow behind them are stateful, OAuth-protected services; this plugin advertises where they live, completes and signs the requestable denials your policy emits, and verifies the approvals a PEP brings back.
+**The plugin always plays the PDP's role in the profile, and can also host the Access Request Service.** The profile allows either — the Access Request Endpoint "MAY be hosted by the PDP itself, by a service trusted by the PDP, or by an independent service operating with delegated authority from the PDP". As a PDP, the plugin advertises where the endpoint lives, completes and signs the requestable denials your policy emits, and verifies the approvals a PEP brings back. With `access_request.service` enabled it also serves the Access Request Endpoint, the Task Status Endpoint and an approver API itself, backed by Postgres; see [Hosted Access Request Service](#hosted-access-request-service).
 
 Two config keys feed the PDP metadata document:
 
@@ -393,7 +394,100 @@ The `approval.state` must be a compact JWS signed by a configured issuer's key a
 {"id": "apr_1", "verified": false, "reason": "approval_unverifiable" | "approval_expired" | "out_of_scope"}
 ```
 
-The `reason` values are the profile's re-evaluation denial reasons, so a policy can return them with a matching `next_action`. The trusted issuers' keys are published in the PDP's JWK Set, which the profile treats as the PDP's statement that it trusts them. A signed state cannot convey later revocation or cancellation, which the profile also requires checking; do that in policy, keyed by the verified `id`. Without `approval_issuers`, `context.approval` reaches the policy unchanged, for deployments that resolve `approval.id` from shared state.
+The `reason` values are the profile's re-evaluation denial reasons, so a policy can return them with a matching `next_action`. The trusted issuers' keys are published in the PDP's JWK Set, which the profile treats as the PDP's statement that it trusts them. A signed state cannot convey later revocation or cancellation, which the profile also requires checking; with an external Access Request Service, do that in policy, keyed by the verified `id`. With the hosted service, approvals are looked up in its store instead, which checks revocation on every re-evaluation (below). Without either, `context.approval` reaches the policy unchanged.
+
+#### Hosted Access Request Service
+
+With `access_request.service.enabled`, the plugin is also the Access Request Service. Its state lives in Postgres, so any number of PDP replicas can serve it against one database; schema migrations run at startup under an advisory lock. Everything deployment-specific is a Rego rule in the package at `path`, so the service carries no product-specific logic.
+
+```yaml
+plugins:
+  authzen:
+    base_url: "https://pdp.example.com"
+    decision_context: decision_context
+    capabilities: ["urn:openid:authzen:capability:access-request"]
+    access_request:
+      signing_key_file: /etc/authzen/pdp-signing.jwk
+      audience: "https://pdp.example.com"
+      binding_context_members: ["project"]
+      service:
+        enabled: true
+        database:
+          dsn_env: AUTHZEN_ARS_DSN       # the DSN is read from this variable only
+          schema: authzen_ars
+          max_conns: 10
+        caller_auth:                     # PEPs and agent runtimes
+          issuers:
+            - issuer: "https://idp.example.com"
+              audience: "https://pdp.example.com"
+              jwks_uri: "https://idp.example.com/.well-known/jwks.json"
+        approver_auth:                   # the approval UI, on behalf of a user
+          issuers:
+            - issuer: "https://idp.example.com"
+              audience: "authzen-approver-api"
+              jwks_uri: "https://idp.example.com/.well-known/jwks.json"
+        rules:
+          caller: ars_caller
+          workflow: ars_workflow
+          approver: ars_approver
+        task_ttl: 72h
+        max_approval_ttl: 720h
+        idempotency_retention: 24h
+        links:                           # optional, into your UI
+          ticket: "https://ui.example.com/requests/{id}"
+          review: "https://ui.example.com/review/{id}"
+```
+
+The service requires `base_url` and a `binding_token` signing key: submissions are bound to the denial only through a token this PDP signed. `access_request_endpoint` defaults to `<base_url>/access/v1/requests`.
+
+**Endpoints.**
+
+| Method and path | Purpose |
+|---|---|
+| `POST /access/v1/requests` | Submit an access request. `202` with a pending task, or `201` with a completed one when the workflow decides automatically. Honors `Idempotency-Key`. |
+| `GET /access/v1/requests/{id}` | Task status; an approved task carries `result: {mode: "reevaluate", approval: {id, approved_at, approved_until, state}}`. |
+| `POST` or `DELETE /access/v1/requests/{id}/cancel` | Cancel a pending task. |
+| `GET /access/v1/admin/tasks` | Approver API: pending tasks whose current step names the approver. |
+| `GET /access/v1/admin/tasks/{id}` | Approver API: one task, with its request, denial, workflow and decisions. |
+| `POST /access/v1/admin/tasks/{id}/decisions` | Approver API: `{"decision": "approve" \| "deny", "comment", "approved_until"}`; `approved_until` may only shorten the planned lifetime. |
+| `POST /access/v1/admin/approvals/{id}/revoke` | Approver API: revoke an approval; the next re-evaluation presenting it is denied. |
+
+The `/access/v1/admin` API is an extension of this plugin, not part of the profile, which leaves out how approvers find and act on requests. Errors use the profile's `application/problem+json` types. Callers and approvers authenticate with bearer JWTs from the configured issuers and are identified by (`iss`, `sub`); sender-constrained tokens (with a `cnf` claim) are rejected.
+
+**Rules.** Each rule receives `input.operation` and returns:
+
+| Rule | Operations | Returns |
+|---|---|---|
+| `caller` | `submit`, `view`, `cancel` | `true` to allow. Input: `caller` (`iss`, `sub`, `client_id`, `act`, `claims`) and `submission` or `task`. |
+| `workflow` | `plan` | `{"steps": [{"name", "required", "approvers": [{"type": "user", "id": <sub>, "properties": {"iss": <optional>}}], "disclose_approvers"}], "approved_until", "auto": "approve" \| "deny", "display"}` |
+| `approver` | `list`, `view`, `decide`, `revoke` | `true` to allow. Approver eligibility — self-approval, separation of duties, delegation — is the `decide` case; it runs under the task's row lock, against the task as it stands. |
+
+A task the caller or approver may not see is reported as unknown. `client.actor` and `client.source` are not passed to the rules, since this version does not verify them.
+
+```rego
+ars_caller if input.operation == "submit"
+ars_caller if input.task.requester.sub == input.caller.sub
+
+ars_workflow := {"steps": [{"name": "manager_approval", "approvers": [{"type": "user", "id": manager}]}]} if {
+    manager := data.org.managers[input.submission.subject.id]
+}
+
+ars_approver if input.operation != "decide"
+ars_approver if {
+    input.operation == "decide"
+    input.approver.id != input.task.subject.id   # no self-approval
+}
+```
+
+**Re-evaluation and revocation.** `context.approval` is resolved by `approval.id` in the store on every re-evaluation, and replaced as described above: revoked or past `approved_until` is `approval_expired`, a request outside the approved subject, resource, action or authorization-relevant context is `out_of_scope`, and an approval the store does not hold is `approval_unverifiable`. If the database cannot be read, the evaluation fails with 500 instead.
+
+**Expiry.** Every replica runs a sweeper that moves pending tasks past `task_ttl` to `expired`; the store's row claims keep replicas from expiring a task twice.
+
+**Audit.** Each committed change — `submitted`, `decided`, `approved`, `denied`, `cancelled`, `expired`, `revoked` — is an OpenTelemetry log record named `authzen.access_request.<event>`, with `authzen.*` attributes for the task, approval, evaluation, actor, subject, resource and action. Records are exported over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set; retention is the OpenTelemetry pipeline's. Without an endpoint the service logs a warning and records are not exported.
+
+**Not yet supported.** Bulk requests (`items` is rejected with 400), callbacks (`callback` is ignored with a warning; poll the Task Status Endpoint), multi-step workflows, actor-chain verification, and DPoP or mTLS-bound tokens.
+
+**With OPA's own authorization.** If OPA runs with `--authentication=token --authorization=basic`, its `system.authz` policy sees every request, including those to `/access/v1/requests` and `/access/v1/admin`, whose bearer tokens are IdP JWTs rather than OPA tokens. Allow those paths in `system.authz`; the service authenticates them itself.
 
 ### Decision logs
 
@@ -490,6 +584,10 @@ PDP metadata discovery endpoint (Section 9).
 ### `GET /access/v1/jwks`
 
 JWK Set (`application/jwk-set+json`) of the public `binding_token` signing key and the trusted `approval.state` signer keys, served when `access_request.signing_key_file` or `access_request.approval_issuers` is configured; 404 otherwise.
+
+### Access Request Service endpoints
+
+Served when `access_request.service` is enabled; see [Hosted Access Request Service](#hosted-access-request-service).
 
 ## License
 
