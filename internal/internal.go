@@ -427,6 +427,7 @@ type AuthZenPlugin struct {
 	arsService *ars.Service
 	arsStore   store.Store
 	arsCancel  context.CancelFunc
+	arsAudit   *otelAuditor
 	// openStore opens the service's store; tests replace it.
 	openStore func(ctx context.Context, s *ServiceConfig) (store.Store, error)
 }

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Tracefort-io/opa-authzen-plugin/internal/ars"
 	"github.com/Tracefort-io/opa-authzen-plugin/internal/ars/store"
@@ -104,6 +105,17 @@ func (p *AuthZenPlugin) startService(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("access request service: opening store: %w", err)
 	}
+	auditor, err := newOTelAuditor(ctx)
+	if err != nil {
+		st.Close()
+		return fmt.Errorf("access request service: %w", err)
+	}
+	var audit ars.Auditor
+	if auditor != nil {
+		audit = auditor
+	} else {
+		p.logger.Warn("AuthZEN access request service: no OTLP endpoint is configured (OTEL_EXPORTER_OTLP_ENDPOINT), so audit records are not exported")
+	}
 	svc := ars.New(&ars.Deps{
 		Store:                st,
 		Callers:              sc.callers,
@@ -118,25 +130,34 @@ func (p *AuthZenPlugin) startService(ctx context.Context) error {
 		MaxApprovalTTL:       sc.maxApprovalTTL,
 		IdempotencyRetention: sc.idempotencyRetention,
 		Logger:               p.logger,
+		Audit:                audit,
 		Now:                  p.now,
 	})
 	workerCtx, cancel := context.WithCancel(context.Background())
 	p.mu.Lock()
-	p.arsService, p.arsStore, p.arsCancel = svc, st, cancel
+	p.arsService, p.arsStore, p.arsCancel, p.arsAudit = svc, st, cancel, auditor
 	p.mu.Unlock()
 	go svc.RunSweeper(workerCtx)
 	p.logger.Info("AuthZEN access request service started")
 	return nil
 }
 
-// stopService stops the workers and closes the store.
+// stopService stops the workers, flushes the audit records and closes the
+// store.
 func (p *AuthZenPlugin) stopService() {
 	p.mu.Lock()
-	cancel, st := p.arsCancel, p.arsStore
-	p.arsService, p.arsStore, p.arsCancel = nil, nil, nil
+	cancel, st, auditor := p.arsCancel, p.arsStore, p.arsAudit
+	p.arsService, p.arsStore, p.arsCancel, p.arsAudit = nil, nil, nil, nil
 	p.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if auditor != nil {
+		ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := auditor.Shutdown(ctx); err != nil {
+			p.logger.Warn("AuthZEN access request service: flushing audit records: %v", err)
+		}
+		done()
 	}
 	if st != nil {
 		st.Close()
