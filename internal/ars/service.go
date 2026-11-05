@@ -111,14 +111,19 @@ func New(deps *Deps) *Service {
 	return &Service{d: d}
 }
 
-// Routes returns the service's handlers keyed by ServeMux pattern.
+// Routes returns the handlers of the ARAP endpoints and the approver API,
+// keyed by ServeMux pattern.
 func (s *Service) Routes() map[string]http.HandlerFunc {
-	return map[string]http.HandlerFunc{
+	routes := map[string]http.HandlerFunc{
 		"POST " + RequestsPath:                    s.handleSubmit,
 		"GET " + RequestsPath + "/{id}":           s.handleStatus,
 		"POST " + RequestsPath + "/{id}/cancel":   s.handleCancel,
 		"DELETE " + RequestsPath + "/{id}/cancel": s.handleCancel,
 	}
+	for pattern, h := range s.adminRoutes() {
+		routes[pattern] = h
+	}
+	return routes
 }
 
 func (s *Service) now() time.Time { return s.d.Now().UTC() }
