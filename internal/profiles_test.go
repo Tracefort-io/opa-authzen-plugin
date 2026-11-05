@@ -681,3 +681,121 @@ func TestValidateAccessRequestConfig(t *testing.T) {
 		t.Fatalf("operator jwks_uri replaced: %q", cfg.JWKSURI)
 	}
 }
+
+// --- Short-circuit batches keep the policy's decision context ---------------
+
+func batchItemContext(t *testing.T, raw json.RawMessage) map[string]any {
+	t.Helper()
+	var ctx map[string]any
+	if err := json.Unmarshal(raw, &ctx); err != nil {
+		t.Fatalf("item context %s: %v", raw, err)
+	}
+	return ctx
+}
+
+func TestDenyOnFirstDenyKeepsRequestableDenial(t *testing.T) {
+	f := newARAPFixture(t, "")
+	body := `{
+		"resource": {"type": "document", "id": "q4-plan"},
+		"action": {"name": "can_read"},
+		"context": {"project": "renewal", "hint": {"template": "manager_approval"},
+		            "extra": {"reason": "approval_required"}},
+		"options": {"evaluations_semantic": "deny_on_first_deny"},
+		"evaluations": [
+			{"subject": {"type": "user", "id": "alice"}},
+			{"subject": {"type": "user", "id": "bob"}},
+			{"subject": {"type": "user", "id": "carol"}}
+		]
+	}`
+	resp := decodeBatchResp(t, postEvaluations(f.p, body))
+	if len(resp.Evaluations) != 2 {
+		t.Fatalf("expected the batch to stop at the second item, got %d results", len(resp.Evaluations))
+	}
+	stop := resp.Evaluations[1]
+	if stop.Decision {
+		t.Fatal("expected the stopping item to be a denial")
+	}
+	ctx := batchItemContext(t, stop.Context)
+	if ctx["code"] != "200" {
+		t.Errorf("expected the short-circuit code, got %v", ctx["code"])
+	}
+	if ctx["reason"] != "approval_required" {
+		t.Errorf("expected the policy's reason to win, got %v", ctx["reason"])
+	}
+	ar, ok := ctx["access_request"].(map[string]any)
+	if !ok {
+		t.Fatalf("requestable denial lost on the stopping item: %s", stop.Context)
+	}
+	if ar["binding_token"] == nil || ctx["evaluation_id"] == nil {
+		t.Fatalf("stopping item lacks denial-binding material: %s", stop.Context)
+	}
+}
+
+func TestShortCircuitMarkerFillsMissingReason(t *testing.T) {
+	p := testPlugin(t, `package authzen
+		default allow = false
+		ctx := {"note": "checked"}`)
+	p.cfg.DecisionContext = "ctx"
+	body := `{
+		"subject": {"type": "user", "id": "bob"},
+		"action": {"name": "read"},
+		"options": {"evaluations_semantic": "deny_on_first_deny"},
+		"evaluations": [{"resource": {"type": "doc", "id": "1"}}, {"resource": {"type": "doc", "id": "2"}}]
+	}`
+	resp := decodeBatchResp(t, postEvaluations(p, body))
+	if len(resp.Evaluations) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(resp.Evaluations))
+	}
+	ctx := batchItemContext(t, resp.Evaluations[0].Context)
+	if ctx["code"] != "200" || ctx["reason"] != "deny_on_first_deny" || ctx["note"] != "checked" {
+		t.Fatalf("expected the marker merged with the policy context, got %v", ctx)
+	}
+}
+
+func TestShortCircuitMarkerUnchangedWithoutDecisionContext(t *testing.T) {
+	p := testPlugin(t, `package authzen
+		default allow = false`)
+	body := `{
+		"subject": {"type": "user", "id": "bob"},
+		"action": {"name": "read"},
+		"options": {"evaluations_semantic": "deny_on_first_deny"},
+		"evaluations": [{"resource": {"type": "doc", "id": "1"}}, {"resource": {"type": "doc", "id": "2"}}]
+	}`
+	resp := decodeBatchResp(t, postEvaluations(p, body))
+	if len(resp.Evaluations) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(resp.Evaluations))
+	}
+	if got := string(resp.Evaluations[0].Context); got != `{"code":"200","reason":"deny_on_first_deny"}` {
+		t.Fatalf("marker changed without a decision_context: %s", got)
+	}
+}
+
+func TestPermitOnFirstPermitKeepsObligations(t *testing.T) {
+	p := obligationPlugin(t, "step-up")
+	body := `{
+		"resource": {"type": "doc", "id": "1"},
+		"action": {"name": "read"},
+		"context": {"issue": [{"id": "o1", "type": "step-up", "properties": {"acr_value": "urn:example:loa:3"}}]},
+		"options": {"evaluations_semantic": "permit_on_first_permit"},
+		"evaluations": [
+			{"subject": {"type": "user", "id": "bob"}},
+			{"subject": {"type": "user", "id": "alice"}},
+			{"subject": {"type": "user", "id": "carol"}}
+		]
+	}`
+	resp := decodeBatchResp(t, postEvaluations(p, body))
+	if len(resp.Evaluations) != 2 {
+		t.Fatalf("expected the batch to stop at the second item, got %d results", len(resp.Evaluations))
+	}
+	stop := resp.Evaluations[1]
+	if !stop.Decision {
+		t.Fatal("expected the stopping item to be a permit")
+	}
+	ctx := batchItemContext(t, stop.Context)
+	if ctx["code"] != "200" || ctx["reason"] != "permit_on_first_permit" {
+		t.Fatalf("expected the short-circuit marker, got %v", ctx)
+	}
+	if _, ok := ctx["obligations"].([]any); !ok {
+		t.Fatalf("obligations lost on the stopping permit: %s", stop.Context)
+	}
+}

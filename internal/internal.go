@@ -859,6 +859,26 @@ func evalErrorResponse(status int, message string) evaluationResponse {
 	return evaluationResponse{Decision: false, Context: errCtx}
 }
 
+// withShortCircuitMarker adds the plugin's short-circuit marker (Section
+// 7.1.2.1) to the policy's decision context for the item that ends a
+// deny_on_first_deny or permit_on_first_permit batch. "code" is always set;
+// "reason" only when the policy set none, so a policy reason such as an
+// Access Request and Approval Profile reason code reaches the PEP. With no
+// policy context the result is the marker alone, as before.
+func withShortCircuitMarker(policyCtx json.RawMessage, semantic evaluationSemantic) json.RawMessage {
+	obj := map[string]any{}
+	if policyCtx != nil {
+		// evalDecisionContext only returns a marshaled JSON object.
+		_ = json.Unmarshal(policyCtx, &obj)
+	}
+	obj["code"] = "200"
+	if _, ok := obj["reason"]; !ok {
+		obj["reason"] = string(semantic)
+	}
+	out, _ := json.Marshal(obj)
+	return out
+}
+
 func (p *AuthZenPlugin) handleEvaluation(w http.ResponseWriter, r *http.Request) {
 	// Echo X-Request-ID if present (Section 10.1.3). Must be set before
 	// any early return so it appears even on error responses.
@@ -1231,29 +1251,10 @@ func (p *AuthZenPlugin) handleEvaluations(w http.ResponseWriter, r *http.Request
 
 		p.logger.WithFields(map[string]any{"path": path, "decision_rule": decisionRule, "decision": decision}).Debug("AuthZEN batch evaluation")
 
-		if semantic == semanticDenyOnFirstDeny && !decision {
-			// Short-circuit: include reason in context (Section 7.1.2.1).
-			result := evaluationResponse{
-				Decision: false,
-				Context:  json.RawMessage(`{"code":"200","reason":"deny_on_first_deny"}`),
-			}
-			ev.log(input, result, nil)
-			results = append(results, result)
-			break
-		}
-		if semantic == semanticPermitOnFirstPermit && decision {
-			result := evaluationResponse{
-				Decision: true,
-				Context:  json.RawMessage(`{"code":"200","reason":"permit_on_first_permit"}`),
-			}
-			ev.log(input, result, nil)
-			results = append(results, result)
-			break
-		}
-
 		// Surface the optional policy-supplied decision context (Section
-		// 5.5.1) on non-short-circuit results. Short-circuit results above
-		// carry the plugin's own reason context instead.
+		// 5.5.1) on every evaluated item, including the one that ends a
+		// short-circuit batch: a requestable denial (Access Request and
+		// Approval Profile) or an obligation there must reach the PEP too.
 		decisionCtx, err := p.evalDecisionContext(r.Context(), txn, input, &snap, decision, ev.regoOptions()...)
 		if err != nil {
 			p.logger.WithFields(map[string]any{"path": path, "error": err}).Error("AuthZEN batch decision context error")
@@ -1265,9 +1266,19 @@ func (p *AuthZenPlugin) handleEvaluations(w http.ResponseWriter, r *http.Request
 			continue
 		}
 
+		// Short-circuit (Section 7.1.2.1): mark the item that ends the batch.
+		stop := (semantic == semanticDenyOnFirstDeny && !decision) ||
+			(semantic == semanticPermitOnFirstPermit && decision)
+		if stop {
+			decisionCtx = withShortCircuitMarker(decisionCtx, semantic)
+		}
+
 		result := evaluationResponse{Decision: decision, Context: decisionCtx}
 		ev.log(input, result, nil)
 		results = append(results, result)
+		if stop {
+			break
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
