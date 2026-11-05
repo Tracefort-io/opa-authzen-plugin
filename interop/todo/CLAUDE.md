@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-OPA-based PDP (Policy Decision Point) for the OpenID AuthZEN interop test suite. Implements a Todo application authorization policy using Rego, designed to pass the [AuthZEN Interop Test Suite](https://github.com/openid/authzen/tree/main/interop/authzen-todo-backend). The PDP runs via [opa-authzen-plugin](https://github.com/kanywst/opa-authzen-plugin).
+OPA-based PDP (Policy Decision Point) for the OpenID AuthZEN interop test suite. Implements a Todo application authorization policy using Rego, designed to pass the [AuthZEN Interop Test Suite](https://github.com/openid/authzen/tree/main/interop/authzen-todo-backend). The PDP runs via [opa-authzen-plugin](https://github.com/Tracefort-io/opa-authzen-plugin).
 
 ## Commands
 

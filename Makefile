@@ -1,5 +1,5 @@
 GO := go
-PKG := github.com/kanywst/opa-authzen-plugin
+PKG := github.com/Tracefort-io/opa-authzen-plugin
 
 BIN := opa-authzen-plugin
 
@@ -63,7 +63,7 @@ lint:
 licenses:
 	$(GO) run github.com/google/go-licenses@$(GO_LICENSES_VERSION) check ./...
 
-IMAGE := ghcr.io/kanywst/opa-authzen-plugin
+IMAGE := ghcr.io/tracefort-io/opa-authzen-plugin
 DOCKER_VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 .PHONY: docker-build

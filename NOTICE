@@ -5,15 +5,39 @@ Licensed under the Apache License, Version 2.0; see LICENSE.
 This fork is maintained by Tracefort (https://github.com/Tracefort-io/opa-authzen-plugin).
 Modifications Copyright 2026 Tracefort, licensed under the same terms.
 
+This fork does not track upstream changes. It renames the Go module to
+github.com/Tracefort-io/opa-authzen-plugin and the container image to
+ghcr.io/tracefort-io/opa-authzen-plugin.
+
 Files modified in this fork:
-  README.md
-  go.mod
+  .github/workflows/publish.yaml
   CHANGELOG.md
+  CONTRIBUTING.md
+  Makefile
+  README.md
+  RELEASE.md
+  build/release-notes.sh
+  cmd/opa-authzen-plugin/main.go
+  cmd/opa-authzen-plugin/main_test.go
   example/config.yaml
+  example/envoy-gateway/backend/go.mod
+  example/envoy-gateway/ext-authz-bridge/go.mod
+  example/kubernetes/README.md
+  example/kubernetes/deployment.yaml
+  example/kubernetes/kustomization.yaml
+  example/kubernetes/test.sh
+  go.mod
   internal/internal.go
+  interop/todo/CLAUDE.md
+  interop/todo/Makefile
+  interop/todo/README.md
+  interop/todo/config.yaml
+  interop/todo/docker-compose.yaml
   interop/todo/policy/authzen.rego
   interop/todo/policy/authzen_test.rego
   interop/todo/scripts/test-local.sh
+  plugin/plugin.go
+  plugin/plugin_test.go
 
 Files added in this fork:
   NOTICE

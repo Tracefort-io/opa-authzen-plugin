@@ -1,3 +1,5 @@
+// Modified by Tracefort (2026) from kanywst/opa-authzen-plugin; see NOTICE.
+
 package plugin
 
 import (
@@ -6,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kanywst/opa-authzen-plugin/internal"
+	"github.com/Tracefort-io/opa-authzen-plugin/internal"
 )
 
 func TestPluginName(t *testing.T) {

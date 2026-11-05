@@ -42,7 +42,7 @@ yarn test http://localhost:8181 authorization-api-1_0-01 console
 ### Using the binary (development)
 
 ```bash
-git clone https://github.com/kanywst/opa-authzen-plugin.git
+git clone https://github.com/Tracefort-io/opa-authzen-plugin.git
 cd opa-authzen-plugin && make build
 cd interop/todo
 
@@ -129,4 +129,4 @@ Rego unit tests (`make rego-test`) cover the same policy rules without a running
 - [AuthZEN Obligations Profile 1.0](https://openid.github.io/authzen/authzen-obligations-profile-1_0.html)
 - [AuthZEN Interop Results](https://authzen-interop.net)
 - [openid/authzen](https://github.com/openid/authzen)
-- [opa-authzen-plugin](https://github.com/kanywst/opa-authzen-plugin)
+- [opa-authzen-plugin](https://github.com/Tracefort-io/opa-authzen-plugin)

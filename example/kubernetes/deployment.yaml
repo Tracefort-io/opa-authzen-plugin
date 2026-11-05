@@ -15,6 +15,9 @@ spec:
         app.kubernetes.io/name: opa-authzen
     spec:
       automountServiceAccountToken: false
+      # The image is private; see README.md for creating this secret.
+      imagePullSecrets:
+        - name: ghcr-pull
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -23,7 +26,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: opa-authzen
-          image: ghcr.io/kanywst/opa-authzen-plugin
+          image: ghcr.io/tracefort-io/opa-authzen-plugin
           args:
             - run
             - --server

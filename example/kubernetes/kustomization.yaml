@@ -15,5 +15,5 @@ configMapGenerator:
       - policy.rego
 
 images:
-  - name: ghcr.io/kanywst/opa-authzen-plugin
+  - name: ghcr.io/tracefort-io/opa-authzen-plugin
     newTag: "0.12.0"

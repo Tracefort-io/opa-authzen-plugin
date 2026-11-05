@@ -1,4 +1,4 @@
-module github.com/kanywst/opa-authzen-plugin
+module github.com/Tracefort-io/opa-authzen-plugin
 
 go 1.26.1
 

@@ -15,6 +15,16 @@ Runs opa-authzen-plugin as a Deployment behind a ClusterIP Service, with the plu
 
 ## Deploy
 
+The image `ghcr.io/tracefort-io/opa-authzen-plugin` is private, so the Deployment pulls it with the image pull secret `ghcr-pull`. Create it once, with a GitHub token that can read the package (`read:packages`):
+
+```bash
+kubectl create namespace authzen
+kubectl -n authzen create secret docker-registry ghcr-pull \
+  --docker-server=ghcr.io \
+  --docker-username=<github-user> \
+  --docker-password=<token>
+```
+
 ```bash
 kubectl apply -k example/kubernetes
 kubectl -n authzen rollout status deploy/opa-authzen

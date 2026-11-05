@@ -1,7 +1,9 @@
+// Modified by Tracefort (2026) from kanywst/opa-authzen-plugin; see NOTICE.
+
 package plugin
 
 import (
-	"github.com/kanywst/opa-authzen-plugin/internal"
+	"github.com/Tracefort-io/opa-authzen-plugin/internal"
 	"github.com/open-policy-agent/opa/v1/plugins"
 )
 

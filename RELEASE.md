@@ -56,7 +56,7 @@ This project currently uses [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 7. **Let the tag workflows run**
 
-   Pushing the tag triggers two workflows. `post-tag.yaml` runs GoReleaser, which cross-compiles the binaries, generates an SPDX SBOM, writes and signs `checksums.txt`, and opens a **draft** GitHub Release with all of it attached. The draft's body is written by `build/release-notes.sh`: the release date, the CHANGELOG section for the tag, and the verification commands below with the image tag filled in. `publish.yaml` builds and pushes the multi-arch image to `ghcr.io/kanywst/opa-authzen-plugin` with an SBOM and provenance attestation, then signs the pushed digest.
+   Pushing the tag triggers two workflows. `post-tag.yaml` runs GoReleaser, which cross-compiles the binaries, generates an SPDX SBOM, writes and signs `checksums.txt`, and opens a **draft** GitHub Release with all of it attached. The draft's body is written by `build/release-notes.sh`: the release date, the CHANGELOG section for the tag, and the verification commands below with the image tag filled in. `publish.yaml` builds and pushes the multi-arch image to `ghcr.io/tracefort-io/opa-authzen-plugin` with an SBOM and provenance attestation, then signs the pushed digest.
 
 8. **Publish the draft Release**
 
@@ -73,7 +73,7 @@ Binaries — verify the signature on `checksums.txt` first, then check the binar
 ```bash
 cosign verify-blob checksums.txt \
   --bundle checksums.txt.sigstore.json \
-  --certificate-identity-regexp '^https://github\.com/kanywst/opa-authzen-plugin/\.github/workflows/post-tag\.yaml@refs/tags/v' \
+  --certificate-identity-regexp '^https://github\.com/Tracefort-io/opa-authzen-plugin/\.github/workflows/post-tag\.yaml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 sha256sum --check --ignore-missing checksums.txt
@@ -82,15 +82,15 @@ sha256sum --check --ignore-missing checksums.txt
 Container image:
 
 ```bash
-cosign verify ghcr.io/kanywst/opa-authzen-plugin:X.Y.Z \
-  --certificate-identity-regexp '^https://github\.com/kanywst/opa-authzen-plugin/\.github/workflows/publish\.yaml@refs/tags/v' \
+cosign verify ghcr.io/tracefort-io/opa-authzen-plugin:X.Y.Z \
+  --certificate-identity-regexp '^https://github\.com/Tracefort-io/opa-authzen-plugin/\.github/workflows/publish\.yaml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
 Bill of materials — the image carries a BuildKit-generated SPDX SBOM and a SLSA provenance attestation, and the GitHub Release carries an SBOM of the source module as `opa_authzen_sbom.spdx.json`:
 
 ```bash
-docker buildx imagetools inspect ghcr.io/kanywst/opa-authzen-plugin:X.Y.Z --format '{{ json .SBOM }}'
+docker buildx imagetools inspect ghcr.io/tracefort-io/opa-authzen-plugin:X.Y.Z --format '{{ json .SBOM }}'
 ```
 
 ## Pre-Release Checks

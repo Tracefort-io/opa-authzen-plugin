@@ -37,7 +37,7 @@ go test -v -run TestName ./internal
 ### 1. Fork and Clone
 
 ```bash
-git clone https://github.com/kanywst/opa-authzen-plugin.git
+git clone https://github.com/Tracefort-io/opa-authzen-plugin.git
 cd opa-authzen-plugin
 ```
 

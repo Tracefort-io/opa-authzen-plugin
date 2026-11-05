@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified by Tracefort (2026) from kanywst/opa-authzen-plugin; see NOTICE.
 # Usage: release-notes.sh TAG [CHANGELOG]
 #
 # Prints the GitHub Release body for TAG: the release date, that version's
@@ -37,13 +38,13 @@ $section
 \`\`\`bash
 cosign verify-blob checksums.txt \\
   --bundle checksums.txt.sigstore.json \\
-  --certificate-identity-regexp '^https://github\.com/kanywst/opa-authzen-plugin/\.github/workflows/post-tag\.yaml@refs/tags/v' \\
+  --certificate-identity-regexp '^https://github\.com/Tracefort-io/opa-authzen-plugin/\.github/workflows/post-tag\.yaml@refs/tags/v' \\
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 sha256sum --check --ignore-missing checksums.txt
 
-cosign verify ghcr.io/kanywst/opa-authzen-plugin:$version \\
-  --certificate-identity-regexp '^https://github\.com/kanywst/opa-authzen-plugin/\.github/workflows/publish\.yaml@refs/tags/v' \\
+cosign verify ghcr.io/tracefort-io/opa-authzen-plugin:$version \\
+  --certificate-identity-regexp '^https://github\.com/Tracefort-io/opa-authzen-plugin/\.github/workflows/publish\.yaml@refs/tags/v' \\
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 \`\`\`
 EOF

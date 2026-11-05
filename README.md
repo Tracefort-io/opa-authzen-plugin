@@ -1,10 +1,10 @@
 # opa-authzen-plugin
 
-[![CI](https://github.com/kanywst/opa-authzen-plugin/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/kanywst/opa-authzen-plugin/actions/workflows/ci.yaml) [![Release](https://img.shields.io/github/v/release/kanywst/opa-authzen-plugin?logo=github)](https://github.com/kanywst/opa-authzen-plugin/releases/latest) [![Go Reference](https://pkg.go.dev/badge/github.com/kanywst/opa-authzen-plugin.svg)](https://pkg.go.dev/github.com/kanywst/opa-authzen-plugin) [![Go Report Card](https://goreportcard.com/badge/github.com/kanywst/opa-authzen-plugin)](https://goreportcard.com/report/github.com/kanywst/opa-authzen-plugin) [![License](https://img.shields.io/github/license/kanywst/opa-authzen-plugin)](LICENSE)
-
 An extended version of OPA (**OPA-AuthZEN**) that implements the [OpenID AuthZEN Authorization API 1.0](https://openid.net/specs/authorization-api-1_0.html) as a native OPA plugin.
 
-> **Looking for `opa-authzen`?** This is it. The repository and Go module are both named **`opa-authzen-plugin`** — import path `github.com/kanywst/opa-authzen-plugin`. The `-plugin` suffix is load-bearing: this is not a gateway or a sidecar in front of OPA, it is a plugin that makes OPA itself serve the AuthZEN endpoints.
+> **Looking for `opa-authzen`?** This is it. The repository and Go module are both named **`opa-authzen-plugin`** — import path `github.com/Tracefort-io/opa-authzen-plugin`. The `-plugin` suffix is load-bearing: this is not a gateway or a sidecar in front of OPA, it is a plugin that makes OPA itself serve the AuthZEN endpoints.
+
+> **Private repository.** The module and image are private. To build against the module from another repository, set `GOPRIVATE=github.com/Tracefort-io/*` and give Git credentials for `github.com/Tracefort-io` (for example `git config --global url."git@github.com:Tracefort-io/".insteadOf "https://github.com/Tracefort-io/"`). To pull the image, authenticate to `ghcr.io` with a token that can read the package; in Kubernetes, use an image pull secret (see [`example/kubernetes/`](./example/kubernetes/)).
 
 ## Architecture
 
@@ -74,7 +74,7 @@ The Authorization API itself is final at 1.0. The two profiles are not: both are
 
 ## Issue Management
 
-Use [GitHub Issues](https://github.com/kanywst/opa-authzen-plugin/issues) to request features or file bugs.
+Use [GitHub Issues](https://github.com/Tracefort-io/opa-authzen-plugin/issues) to request features or file bugs.
 
 ## Quick Start
 
@@ -230,11 +230,11 @@ make docker-build
 make docker-run
 ```
 
-The published image is `ghcr.io/kanywst/opa-authzen-plugin`. Pass `--addr 0.0.0.0:8181` when you publish the port: OPA binds `localhost` by default, so a container started without it accepts no connections from outside itself.
+The published image is `ghcr.io/tracefort-io/opa-authzen-plugin`, which is private: run `docker login ghcr.io` with a token that can read the package before pulling. Pass `--addr 0.0.0.0:8181` when you publish the port: OPA binds `localhost` by default, so a container started without it accepts no connections from outside itself.
 
 ```bash
 docker run --rm -p 8181:8181 -v "$PWD/example:/example:ro" \
-  ghcr.io/kanywst/opa-authzen-plugin:latest \
+  ghcr.io/tracefort-io/opa-authzen-plugin:latest \
   run --server --addr 0.0.0.0:8181 --config-file /example/config.yaml /example/policy.rego
 ```
 

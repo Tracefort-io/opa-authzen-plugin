@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified by Tracefort (2026) from kanywst/opa-authzen-plugin; see NOTICE.
 # Smoke test for the Kubernetes example on a kind cluster.
 # Usage: ./test.sh  (KEEP_CLUSTER=1 leaves the cluster up)
 set -euo pipefail
@@ -31,7 +32,7 @@ fi
 kind load docker-image "$image" --name "$cluster"
 
 kubectl kustomize "$here" |
-  sed "s|image: ghcr.io/kanywst/opa-authzen-plugin:.*|image: $image|" |
+  sed "s|image: ghcr.io/tracefort-io/opa-authzen-plugin:.*|image: $image|" |
   kubectl --context "$ctx" apply -f -
 if [ "$created" = 0 ]; then
   kubectl --context "$ctx" -n authzen rollout restart deploy/opa-authzen

@@ -1,4 +1,4 @@
-module github.com/kanywst/opa-authzen-plugin/example/envoy-gateway/ext-authz-bridge
+module github.com/Tracefort-io/opa-authzen-plugin/example/envoy-gateway/ext-authz-bridge
 
 go 1.26.2
 

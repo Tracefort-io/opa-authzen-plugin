@@ -6,7 +6,10 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # Container registries require lowercase repository names, and
+  # github.repository is "Tracefort-io/…"; workflow expressions cannot
+  # lowercase it, so the name is spelled out.
+  IMAGE_NAME: tracefort-io/opa-authzen-plugin
 
 jobs:
   publish:

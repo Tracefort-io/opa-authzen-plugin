@@ -1,9 +1,11 @@
+// Modified by Tracefort (2026) from kanywst/opa-authzen-plugin; see NOTICE.
+
 package main
 
 import (
 	"testing"
 
-	"github.com/kanywst/opa-authzen-plugin/plugin"
+	"github.com/Tracefort-io/opa-authzen-plugin/plugin"
 	"github.com/open-policy-agent/opa/v1/plugins"
 )
 

@@ -1,4 +1,4 @@
-PDP_IMAGE := ghcr.io/kanywst/opa-authzen-plugin
+PDP_IMAGE := ghcr.io/tracefort-io/opa-authzen-plugin
 # Pin to a concrete release rather than `latest`, which lags. The suite needs
 # 0.10 or newer: batch evaluations and Search arrived in 0.3, capability URNs
 # in the metadata document in 0.4, decision context in 0.5, the Obligations

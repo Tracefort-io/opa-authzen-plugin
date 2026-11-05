@@ -582,7 +582,7 @@ try:
     ok = isinstance(m.get("policy_decision_point"), str)
     ok = ok and all(isinstance(m.get(k), str) and m[k].endswith(suf) for k, suf in checks)
     caps = m.get("capabilities")
-    ok = ok and isinstance(caps, list) and caps == ["urn:kanywst:authzen:capability:todo-interop"]
+    ok = ok and isinstance(caps, list) and caps == ["urn:tracefort:authzen:capability:todo-interop"]
     ok = ok and m.get("supported_obligations") == ["notification"]
     # Access Request and Approval Profile discovery: advertised verbatim from
     # config, not derived from the request host like the endpoints above.

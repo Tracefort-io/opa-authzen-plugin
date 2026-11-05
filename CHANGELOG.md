@@ -444,7 +444,7 @@ Packaging only. Plugin behavior is identical to v0.5.0 — `internal/` has no no
 
 ---
 
-[Unreleased]: https://github.com/kanywst/opa-authzen-plugin/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/Tracefort-io/opa-authzen-plugin/compare/v0.12.0...HEAD
 [v0.12.0]: https://github.com/kanywst/opa-authzen-plugin/compare/v0.11.0...v0.12.0
 [v0.11.0]: https://github.com/kanywst/opa-authzen-plugin/compare/v0.10.0...v0.11.0
 [v0.10.0]: https://github.com/kanywst/opa-authzen-plugin/compare/v0.9.3...v0.10.0
