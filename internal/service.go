@@ -129,6 +129,9 @@ func (p *AuthZenPlugin) startService(ctx context.Context) error {
 		TaskTTL:              sc.taskTTL,
 		MaxApprovalTTL:       sc.maxApprovalTTL,
 		IdempotencyRetention: sc.idempotencyRetention,
+		MaxItems:             sc.MaxItems,
+		MaxSteps:             sc.MaxSteps,
+		Callbacks:            sc.callbacks,
 		Logger:               p.logger,
 		Audit:                audit,
 		Now:                  p.now,
@@ -138,6 +141,8 @@ func (p *AuthZenPlugin) startService(ctx context.Context) error {
 	p.arsService, p.arsStore, p.arsCancel, p.arsAudit = svc, st, cancel, auditor
 	p.mu.Unlock()
 	go svc.RunSweeper(workerCtx)
+	go svc.RunPurger(workerCtx)
+	go svc.RunCallbacks(workerCtx)
 	p.logger.Info("AuthZEN access request service started")
 	return nil
 }

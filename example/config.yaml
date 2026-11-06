@@ -65,3 +65,8 @@ plugins:
     #     approver_auth:
     #       issuers: [{issuer: "https://idp.example.com", audience: "authzen-approver-api", jwks_uri: "https://idp.example.com/.well-known/jwks.json"}]
     #     rules: {caller: ars_caller, workflow: ars_workflow, approver: ars_approver}
+    #     # Optional: callback notifications, keyed per host by a secret of
+    #     # at least 32 bytes read from the environment.
+    #     callbacks:
+    #       destinations:
+    #         - {host: agents.example.com, hmac_secret_env: AUTHZEN_ARS_CALLBACK_SECRET_AGENTS}

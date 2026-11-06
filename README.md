@@ -68,7 +68,7 @@ The plugin registers AuthZEN endpoints directly on OPA's own HTTP server (`:8181
 | [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | PDP discovery: `access_request_endpoint`, `jwks_uri`, capability URN | ✅ Supported (opt-in) — see [below](#access-request-and-approval-profile) |
 | [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | Requestable-denial issuance: placement rules, `expires_at`, `evaluation_id`, signed `binding_token`, served JWK Set | ✅ Supported (opt-in) |
 | [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | Approval verification at re-evaluation (`approval.state`, exact-match scope) | ✅ Supported (opt-in via `access_request.approval_issuers`) |
-| [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | Access Request Service: submission, Task Status, cancellation, single-step approval with quorum, revocation (Postgres) | ✅ Supported (opt-in via `access_request.service`) — single-item requests; bulk, callbacks and actor verification are not yet supported |
+| [Access Request and Approval Profile (Draft 1)](https://openid.github.io/authzen/authzen-access-request-approval-profile-1_0.html) | Access Request Service: submission, Task Status, cancellation, single-step approval with quorum, revocation (Postgres) | ✅ Supported (opt-in via `access_request.service`), with the Bulk, Callback and Actor Delegation companion profiles; the Catalog profile is not supported |
 
 The Authorization API itself is final at 1.0. The two profiles are not: both are titled **Draft 1** upstream, and the `1_0` in their filenames and URLs is the document name, not a released version. Support for them is opt-in and their normative text can still move — the denial-binding rules in the Access Request and Approval profile changed in September 2026, after this plugin shipped support for its discovery members.
 
@@ -433,9 +433,18 @@ plugins:
         task_ttl: 72h
         max_approval_ttl: 720h
         idempotency_retention: 24h
+        max_items: 50                    # bulk submissions
+        max_steps: 10                    # workflow steps
         links:                           # optional, into your UI
           ticket: "https://ui.example.com/requests/{id}"
           review: "https://ui.example.com/review/{id}"
+        callbacks:                       # optional; without it `callback` is rejected
+          timeout: 5s
+          max_attempts: 8
+          destinations:
+            - host: agents.example.com
+              hmac_secret_env: AUTHZEN_ARS_CALLBACK_SECRET_AGENTS   # at least 32 bytes
+              allow_internal: false      # true for an in-cluster PEP
 ```
 
 The service requires `base_url` and a `binding_token` signing key: submissions are bound to the denial only through a token this PDP signed. `access_request_endpoint` defaults to `<base_url>/access/v1/requests`.
@@ -444,12 +453,12 @@ The service requires `base_url` and a `binding_token` signing key: submissions a
 
 | Method and path | Purpose |
 |---|---|
-| `POST /access/v1/requests` | Submit an access request. `202` with a pending task, or `201` with a completed one when the workflow decides automatically. Honors `Idempotency-Key`. |
-| `GET /access/v1/requests/{id}` | Task status; an approved task carries `result: {mode: "reevaluate", approval: {id, approved_at, approved_until, state}}`. |
-| `POST` or `DELETE /access/v1/requests/{id}/cancel` | Cancel a pending task. |
-| `GET /access/v1/admin/tasks` | Approver API: pending tasks whose current step names the approver. |
-| `GET /access/v1/admin/tasks/{id}` | Approver API: one task, with its request, denial, workflow and decisions. |
-| `POST /access/v1/admin/tasks/{id}/decisions` | Approver API: `{"decision": "approve" \| "deny", "comment", "approved_until"}`; `approved_until` may only shorten the planned lifetime. |
+| `POST /access/v1/requests` | Submit an access request, one `resource`/`action` or several `items`. `202` with a pending task, or `201` with a completed one when the workflow decides automatically. Honors `Idempotency-Key`. |
+| `GET /access/v1/requests/{id}` | Task status; an approved task carries `result: {mode: "reevaluate", approval: {id, approved_at, approved_until, state}}`, a bulk task one per approved item in `task.items[]`. |
+| `POST` or `DELETE /access/v1/requests/{id}/cancel` | Cancel a pending task: its pending items are cancelled, completed ones kept. |
+| `GET /access/v1/admin/tasks` | Approver API: pending tasks with an item whose current step names the approver. |
+| `GET /access/v1/admin/tasks/{id}` | Approver API: one task, with its request items (each with its step and denial), workflow and decisions. |
+| `POST /access/v1/admin/tasks/{id}/decisions` | Approver API: `{"decision": "approve" \| "deny", "items": [0, 2], "comment", "approved_until"}`. `items` defaults to every item the approver can decide now; the decision is all or nothing. `approved_until` may only shorten the planned lifetime. |
 | `POST /access/v1/admin/approvals/{id}/revoke` | Approver API: revoke an approval; the next re-evaluation presenting it is denied. |
 
 The `/access/v1/admin` API is an extension of this plugin, not part of the profile, which leaves out how approvers find and act on requests. Errors use the profile's `application/problem+json` types. Callers and approvers authenticate with bearer JWTs from the configured issuers and are identified by (`iss`, `sub`); sender-constrained tokens (with a `cnf` claim) are rejected.
@@ -458,11 +467,31 @@ The `/access/v1/admin` API is an extension of this plugin, not part of the profi
 
 | Rule | Operations | Returns |
 |---|---|---|
-| `caller` | `submit`, `view`, `cancel` | `true` to allow. Input: `caller` (`iss`, `sub`, `client_id`, `act`, `claims`) and `submission` or `task`. |
-| `workflow` | `plan` | `{"steps": [{"name", "required", "approvers": [{"type": "user", "id": <sub>, "properties": {"iss": <optional>}}], "disclose_approvers"}], "approved_until", "auto": "approve" \| "deny", "display"}` |
-| `approver` | `list`, `view`, `decide`, `revoke` | `true` to allow. Approver eligibility — self-approval, separation of duties, delegation — is the `decide` case; it runs under the task's row lock, against the task as it stands. |
+| `caller` | `submit`, `view`, `cancel` | `true` to allow. Input: `caller` (`iss`, `sub`, `client_id`, `act`, `claims`) and `submission` (with `items`, `bulk` and, if submitted, `callback.endpoint`, so the rule can restrict callers to their own endpoints) or `task`. |
+| `workflow` | `plan` | `{"steps": [{"name", "required", "approvers": [{"type": "user", "id": <sub>, "properties": {"iss": <optional>}}], "disclose_approvers"}], "approved_until", "auto", "display"}`. `auto` is `"approve"` or `"deny"` for every item, or an array with one of those or `null` per item. |
+| `approver` | `list`, `view`, `decide`, `revoke` | `true` to allow. Approver eligibility — self-approval, separation of duties, delegation — is the `decide` case, evaluated per item with `item` and `step`; it runs under the task's row lock, against the task as it stands, including `task.decisions`. |
 
-A task the caller or approver may not see is reported as unknown. `client.actor` and `client.source` are not passed to the rules, since this version does not verify them.
+A task the caller or approver may not see is reported as unknown.
+
+**Steps.** Steps run in order and each item moves through them on its own: an approve completing a step's `required` quorum moves the item to the next step, or approves it on the last; any deny denies the item. The approval's lifetime is the shortest `approved_until` any of the item's approvers gave. Rules that span steps, such as "nobody approves two steps", are written against `task.decisions`:
+
+```rego
+ars_approver if {
+    input.operation == "decide"
+    not approved_earlier_step
+}
+approved_earlier_step if {
+    some d in input.task.decisions
+    d.approver.sub == input.approver.id
+    d.step < input.step.index
+}
+```
+
+**Bulk requests (Bulk Profile).** A submission may carry `items` instead of `resource` and `action`, at most `max_items`. Each item is bound by its own `denial`: this PDP signs one `binding_token` per evaluation, also within a batch, so it never issues a bundle denial, and a top-level `denial` can bind one item only. The handle lists `items` with their `status`, and each approved item has its own `result`; there is no top-level `result`, and a task whose items ended differently is `partial`. Re-evaluate each approved item with its own approval.
+
+**Actor chains (Actor Delegation Profile).** A claimed actor, in `client.actor` (`id`, `issuer`, nested `act`) or in `subject.properties.act`, must equal the RFC 8693 `act` chain of the caller's token, link for link as (`iss`, `sub`) pairs and of the same length; otherwise the submission is rejected with 403. The verified `client.actor` reaches the rules with `client.actor_verified: true`. `client.source` cannot be verified, never reaches the rules, and is kept for the approver API and audit.
+
+**Callbacks (Callback Profile).** With `callbacks` configured, a submission's `callback` (`endpoint`, `state`, `events`) must name an `https` URL on a listed host that does not resolve to an internal address unless the host sets `allow_internal`; anything else, or any `callback` without `callbacks`, is rejected with 400. When the task completes with a requested event (all terminal events by default), every replica's delivery worker may send `{"state", "task": {"id", "status", "status_endpoint", "items"}}` — never a `result`, so read the status endpoint before enforcing. Each POST carries `X-AuthZEN-Signature: t=<unix time>,v1=<hex HMAC-SHA256 of "<t>.<body>">` keyed with the host's secret, and `X-AuthZEN-Delivery`, an id to drop duplicates by, since delivery is at least once. The address is checked again on the IP dialled, redirects are not followed, and failures are retried with exponential backoff up to `max_attempts`.
 
 ```rego
 ars_caller if input.operation == "submit"
@@ -481,11 +510,11 @@ ars_approver if {
 
 **Re-evaluation and revocation.** `context.approval` is resolved by `approval.id` in the store on every re-evaluation, and replaced as described above: revoked or past `approved_until` is `approval_expired`, a request outside the approved subject, resource, action or authorization-relevant context is `out_of_scope`, and an approval the store does not hold is `approval_unverifiable`. If the database cannot be read, the evaluation fails with 500 instead.
 
-**Expiry.** Every replica runs a sweeper that moves pending tasks past `task_ttl` to `expired`; the store's row claims keep replicas from expiring a task twice.
+**Expiry and cleanup.** Every replica runs a sweeper that expires the pending items of tasks past `task_ttl` (a bulk task with items completed first becomes `partial`), and a purge worker that deletes terminal tasks past `task_ttl` plus `idempotency_retention` once none of their approvals is still in force, along with lapsed idempotency keys and `binding_token` identifiers. The store's row claims keep replicas from doing either twice.
 
-**Audit.** Each committed change — `submitted`, `decided`, `approved`, `denied`, `cancelled`, `expired`, `revoked` — is an OpenTelemetry log record named `authzen.access_request.<event>`, with `authzen.*` attributes for the task, approval, evaluation, actor, subject, resource and action. Records are exported over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set; retention is the OpenTelemetry pipeline's. Without an endpoint the service logs a warning and records are not exported.
+**Audit.** Each committed change — `submitted`, `decided`, `step_completed`, `approved`, `denied`, `partial`, `cancelled`, `expired`, `revoked`, `callback_delivered`, `callback_failed` — is an OpenTelemetry log record named `authzen.access_request.<event>`, with `authzen.*` attributes for the task, approval, evaluation, actor, subject, resource and action (or `items` for a bulk task). Records are exported over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set; retention is the OpenTelemetry pipeline's. Without an endpoint the service logs a warning and records are not exported.
 
-**Not yet supported.** Bulk requests (`items` is rejected with 400), callbacks (`callback` is ignored with a warning; poll the Task Status Endpoint), multi-step workflows, actor-chain verification, and DPoP or mTLS-bound tokens.
+**Not yet supported.** DPoP or mTLS-bound tokens, the Catalog profile, and OpenTelemetry metrics.
 
 **With OPA's own authorization.** If OPA runs with `--authentication=token --authorization=basic`, its `system.authz` policy sees every request, including those to `/access/v1/requests` and `/access/v1/admin`, whose bearer tokens are IdP JWTs rather than OPA tokens. Allow those paths in `system.authz`; the service authenticates them itself.
 

@@ -11,7 +11,18 @@ Changes in the Tracefort fork. Nothing changes for a deployment that sets none o
 
 ### Added
 
-- Hosted Access Request Service (`access_request.service`), phase 1 of `docs/design/access-request-service.md`: the AuthZEN Access Request and Approval Profile's submission, Task Status and cancellation endpoints plus an approver API (`/access/v1/admin`, a plugin extension), backed by Postgres (pgx v5) so replicas share state. Authorization, routing and approver eligibility are the operator's `caller`, `workflow` and `approver` Rego rules. Submissions are bound to the denial by the PDP-signed `binding_token` and deduplicated by `Idempotency-Key`; approvals take single-step workflows with a quorum, or an automatic decision. Callers and approvers authenticate with bearer JWTs from configured issuers. Bulk `items` are rejected and `callback` is ignored in this version.
+- Hosted Access Request Service (`access_request.service`), phase 1 of `docs/design/access-request-service.md`: the AuthZEN Access Request and Approval Profile's submission, Task Status and cancellation endpoints plus an approver API (`/access/v1/admin`, a plugin extension), backed by Postgres (pgx v5) so replicas share state. Authorization, routing and approver eligibility are the operator's `caller`, `workflow` and `approver` Rego rules. Submissions are bound to the denial by the PDP-signed `binding_token` and deduplicated by `Idempotency-Key`; approvals take single-step workflows with a quorum, or an automatic decision. Callers and approvers authenticate with bearer JWTs from configured issuers.
+- Access Request Service phase 2:
+  - multi-step workflows: ordered steps, each with a quorum, each item moving through them on its own; the approval lifetime is the shortest `approved_until` any approver gave;
+  - the Bulk profile: `items`, each bound by its own `denial`; per-item status and results; the `partial` status; `auto` per item; approver decisions on chosen `items`;
+  - the Callback profile: `callback` to configured `callbacks.destinations`, delivered from a transactional outbox by every replica with an HMAC-SHA256 `X-AuthZEN-Signature`, re-checked against internal addresses at connection time, and retried with backoff;
+  - Actor Delegation profile verification of `client.actor` and `subject.properties.act` against the caller token's `act` chain;
+  - a purge worker for expired rows.
+  - New options: `max_items`, `max_steps` and `callbacks`. Schema migration `0002` runs at startup.
+- Changed from phase 1:
+  - a submitted `callback` is rejected with 400 unless `callbacks` allows its endpoint (it was ignored);
+  - a claimed actor chain the caller's token does not carry is rejected with 403 (it was withheld from the rules);
+  - the approver API task view lists `request.items` in place of `item` and `request.resource`/`action`.
 - With the service enabled, re-evaluation resolves `context.approval` in its store and checks its current status: a revoked approval is `approval_expired`, closing the revocation gap of the signed-approval path. A store error fails the evaluation with 500.
 - Access Request Service audit records are OpenTelemetry log records (`authzen.access_request.<event>`), exported over OTLP/HTTP when an OTLP endpoint is configured.
 - `go.opentelemetry.io/otel` moves from 1.46 to 1.47 with the new log dependencies.

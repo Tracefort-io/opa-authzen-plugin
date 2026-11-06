@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
@@ -23,6 +24,7 @@ const (
 var (
 	errNotCandidate = errors.New("approver is not a candidate for the current step")
 	errForbidden    = errors.New("approver rule denied the operation")
+	errUnknownItem  = errors.New("no such item")
 )
 
 // adminRoutes are the approver API handlers keyed by ServeMux pattern.
@@ -54,41 +56,63 @@ func approverMatches(candidate map[string]any, iss, sub string) bool {
 	return true
 }
 
-func isCandidate(t *store.Task, id *authn.Identity) bool {
-	if t.CurrentStep >= len(t.Workflow.Steps) {
+// isCandidateFor reports whether an approver is a candidate at the step a
+// pending item is at.
+func isCandidateFor(t *store.Task, it *store.Item, id *authn.Identity) bool {
+	if it.Status != store.StatusPending || it.CurrentStep >= len(t.Workflow.Steps) {
 		return false
 	}
-	for _, a := range t.Workflow.Steps[t.CurrentStep].Approvers {
-		if approverMatches(a, id.Iss, id.Sub) {
-			return true
+	return slices.ContainsFunc(t.Workflow.Steps[it.CurrentStep].Approvers, func(a map[string]any) bool {
+		return approverMatches(a, id.Iss, id.Sub)
+	})
+}
+
+// candidateItems lists the pending items the approver can decide now.
+func candidateItems(t *store.Task, id *authn.Identity) []int {
+	var out []int
+	for i := range t.Items {
+		if isCandidateFor(t, &t.Items[i], id) {
+			out = append(out, i)
 		}
 	}
-	return false
+	return out
 }
 
 // adminView is a task as the approval UI sees it: the handle plus what the
-// approver needs to decide. Unlike the requester's view it includes the
-// candidate approvers and the decisions so far.
+// approver needs to decide. Unlike the requester's view it includes each
+// item's step and denial, the workflow, and the decisions so far.
 func (s *Service) adminView(t *store.Task) map[string]any {
 	v := s.taskHandle(t)
-	item := map[string]any{}
-	if len(t.Items) > 0 {
-		item = map[string]any{"resource": t.Items[0].Resource, "action": t.Items[0].Action, "status": t.Items[0].Status}
-		if t.Items[0].ApprovalID != "" {
-			item["approval_id"] = t.Items[0].ApprovalID
+	items := make([]any, len(t.Items))
+	for i, it := range t.Items {
+		d := it.Denial
+		if d == nil {
+			d = t.Denial
 		}
+		item := map[string]any{
+			"index": it.Index, "resource": it.Resource, "action": it.Action,
+			"requested_access": it.RequestedAccess, "status": it.Status, "current_step": it.CurrentStep + 1,
+			"denial": map[string]any{"template": d["template"], "reason": d["reason"], "evaluation_id": d["evaluation_id"]},
+		}
+		if it.ApprovalID != "" {
+			item["approval_id"] = it.ApprovalID
+		}
+		items[i] = item
 	}
 	decisions := make([]any, len(t.Decisions))
 	for i, d := range t.Decisions {
-		decisions[i] = map[string]any{
-			"step": d.Step + 1, "approver": map[string]any{"iss": d.ApproverIss, "sub": d.ApproverSub},
+		dv := map[string]any{
+			"item": d.ItemIndex, "step": d.Step + 1, "approver": map[string]any{"iss": d.ApproverIss, "sub": d.ApproverSub},
 			"decision": d.Decision, "comment": d.Comment, "decided_at": d.DecidedAt.UTC().Format(time.RFC3339),
 		}
+		if d.ApprovedUntil != nil {
+			dv["approved_until"] = d.ApprovedUntil.UTC().Format(time.RFC3339)
+		}
+		decisions[i] = dv
 	}
 	v["request"] = map[string]any{
 		"subject":          t.Subject,
-		"resource":         item["resource"],
-		"action":           item["action"],
+		"items":            items,
 		"context":          t.Context,
 		"requested_access": t.RequestedAccess,
 		"client":           t.Client,
@@ -97,7 +121,6 @@ func (s *Service) adminView(t *store.Task) map[string]any {
 	}
 	v["denial"] = map[string]any{"template": t.Template, "reason": t.Denial["reason"], "evaluation_id": t.EvaluationID}
 	v["workflow"] = t.Workflow
-	v["item"] = item
 	v["decisions"] = decisions
 	return v
 }
@@ -132,7 +155,7 @@ func (s *Service) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	out := []any{}
 	for _, t := range tasks {
-		if !isCandidate(t, approver) {
+		if len(candidateItems(t, approver)) == 0 {
 			continue
 		}
 		ok, err := s.allowed(r.Context(), s.d.Rules.Approver, map[string]any{"operation": "list", "approver": approverInput(approver), "task": ruleTask(t)})
@@ -199,21 +222,21 @@ func (s *Service) handleDecide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Decision      string          `json:"decision"`
-		Comment       string          `json:"comment"`
-		ApprovedUntil string          `json:"approved_until"`
-		Items         json.RawMessage `json:"items"`
+		Decision      string `json:"decision"`
+		Comment       string `json:"comment"`
+		ApprovedUntil string `json:"approved_until"`
+		Items         *[]int `json:"items"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&body); err != nil {
-		badRequest(w, "the body must be a JSON object")
+		badRequest(w, "the body must be a JSON object; items must be an array of item indexes")
 		return
 	}
 	if body.Decision != store.DecisionApprove && body.Decision != store.DecisionDeny {
 		badRequest(w, `decision must be "approve" or "deny"`)
 		return
 	}
-	if len(body.Items) > 0 {
-		badRequest(w, "items is not supported")
+	if body.Items != nil && len(*body.Items) == 0 {
+		badRequest(w, "items must list at least one item")
 		return
 	}
 	var override *time.Time
@@ -227,57 +250,46 @@ func (s *Service) handleDecide(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := s.now()
-	var approval *store.Approval
+	var advanced []int
 	updated, err := s.d.Store.UpdateTask(r.Context(), t.ID, func(cur *store.Task) (*store.Change, error) {
 		if store.IsTerminal(cur.Status) {
 			return nil, store.ErrConflict
 		}
-		if !isCandidate(cur, approver) {
-			return nil, errNotCandidate
-		}
-		// Eligibility (self-approval, separation of duties, delegation) is
-		// the approver rule's, checked against the task as it now stands.
-		step := cur.Workflow.Steps[cur.CurrentStep]
-		ok, err := s.allowed(r.Context(), s.d.Rules.Approver, map[string]any{
-			"operation": "decide",
-			"approver":  approverInput(approver),
-			"task":      ruleTask(cur),
-			"step":      map[string]any{"index": cur.CurrentStep, "name": step.Name, "required": step.Required},
-			"decision":  map[string]any{"decision": body.Decision, "comment": body.Comment},
-		})
+		targets, err := decisionTargets(cur, approver, body.Items)
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
-			return nil, errForbidden
-		}
-		decision := store.Decision{
-			ItemIndex: 0, Step: cur.CurrentStep, ApproverIss: approver.Iss, ApproverSub: approver.Sub,
-			Decision: body.Decision, Comment: body.Comment, DecidedAt: now,
-		}
-		ch := &store.Change{NewDecisions: []store.Decision{decision}}
-		if body.Decision == store.DecisionDeny {
-			ch.Status, ch.CompletedAt, ch.ItemStatus = store.StatusDenied, &now, map[int]string{0: store.StatusDenied}
-			return ch, nil
-		}
-		approvals := 1
-		for _, d := range cur.Decisions {
-			if d.Step == cur.CurrentStep && d.ItemIndex == 0 && d.Decision == store.DecisionApprove {
-				approvals++
+		// Eligibility (self-approval, separation of duties, delegation) is
+		// the approver rule's, checked per item against the task as it now
+		// stands. One refusal rejects the whole decision.
+		for _, idx := range targets {
+			it := cur.Items[idx]
+			step := cur.Workflow.Steps[it.CurrentStep]
+			ok, err := s.allowed(r.Context(), s.d.Rules.Approver, map[string]any{
+				"operation": "decide",
+				"approver":  approverInput(approver),
+				"task":      ruleTask(cur),
+				"item":      map[string]any{"index": idx, "resource": it.Resource, "action": it.Action},
+				"step":      map[string]any{"index": it.CurrentStep, "name": step.Name, "required": step.Required},
+				"decision":  map[string]any{"decision": body.Decision, "comment": body.Comment},
+			})
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return nil, errForbidden
 			}
 		}
-		if approvals >= step.Required {
-			approval = s.newApproval(cur, 0, bindingMembers(cur), now, override)
-			ch.Status, ch.CompletedAt = store.StatusApproved, &now
-			ch.ItemStatus = map[int]string{0: store.StatusApproved}
-			ch.ItemApproval = map[int]string{0: approval.ID}
-			ch.NewApprovals = []*store.Approval{approval}
-		}
+		var ch *store.Change
+		ch, advanced = s.applyDecision(cur, targets, approver, body.Decision, body.Comment, override, now)
 		return ch, nil
 	})
 	switch {
 	case errors.Is(err, store.ErrConflict):
-		writeProblem(w, http.StatusConflict, ProblemInvalidState, "Decision not accepted", "the task is complete or this approver already decided this step")
+		writeProblem(w, http.StatusConflict, ProblemInvalidState, "Decision not accepted", "the task or item is complete, or this approver already decided it at this step")
+		return
+	case errors.Is(err, errUnknownItem):
+		badRequest(w, "items names an item the task does not have")
 		return
 	case errors.Is(err, errNotCandidate), errors.Is(err, errForbidden):
 		forbidden(w)
@@ -290,28 +302,101 @@ func (s *Service) handleDecide(w http.ResponseWriter, r *http.Request) {
 	attrs := s.auditTask(updated, approver)
 	attrs["decision"], attrs["comment"] = body.Decision, body.Comment
 	s.d.Audit.Emit(r.Context(), "decided", attrs)
+	for _, idx := range advanced {
+		sc := s.auditTask(updated, approver)
+		sc["item"], sc["step"] = strconv.Itoa(idx), strconv.Itoa(updated.Items[idx].CurrentStep)
+		s.d.Audit.Emit(r.Context(), "step_completed", sc)
+	}
 	if store.IsTerminal(updated.Status) {
 		s.d.Audit.Emit(r.Context(), updated.Status, s.auditTask(updated, approver))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"task": s.adminView(updated)})
 }
 
-// bindingMembers reads the authorization-relevant context member names the
-// denial was bound with; JSON round trips may leave them as []any.
-func bindingMembers(t *store.Task) []string {
-	switch m := t.Denial["binding_context_members"].(type) {
-	case []string:
-		return m
-	case []any:
-		out := make([]string, 0, len(m))
-		for _, v := range m {
-			if s, ok := v.(string); ok {
-				out = append(out, s)
+// decisionTargets resolves which items a decision applies to: the listed
+// ones, each pending with the approver a candidate at its step, or else
+// every item the approver can decide now. An approver who already decided
+// a target at its step conflicts.
+func decisionTargets(t *store.Task, approver *authn.Identity, listed *[]int) ([]int, error) {
+	var targets []int
+	if listed == nil {
+		if targets = candidateItems(t, approver); len(targets) == 0 {
+			return nil, errNotCandidate
+		}
+	} else {
+		for _, idx := range *listed {
+			if idx < 0 || idx >= len(t.Items) {
+				return nil, errUnknownItem
+			}
+			if slices.Contains(targets, idx) {
+				continue
+			}
+			it := &t.Items[idx]
+			if it.Status != store.StatusPending {
+				return nil, store.ErrConflict
+			}
+			if !isCandidateFor(t, it, approver) {
+				return nil, errNotCandidate
+			}
+			targets = append(targets, idx)
+		}
+	}
+	for _, idx := range targets {
+		step := t.Items[idx].CurrentStep
+		if slices.ContainsFunc(t.Decisions, func(d store.Decision) bool {
+			return d.ItemIndex == idx && d.Step == step && d.ApproverIss == approver.Iss && d.ApproverSub == approver.Sub
+		}) {
+			return nil, store.ErrConflict
+		}
+	}
+	return targets, nil
+}
+
+// applyDecision records a decision on each target item and moves it on:
+// a deny denies the item; an approve that completes its step's quorum
+// either moves it to the next step or, on the last step, approves it with
+// the shortest lifetime any of its approvers gave. It returns the change
+// and the items that moved to a next step.
+func (s *Service) applyDecision(t *store.Task, targets []int, approver *authn.Identity, decision, comment string, override *time.Time, now time.Time) (*store.Change, []int) {
+	ch := &store.Change{ItemStatus: map[int]string{}, ItemApproval: map[int]string{}, ItemStep: map[int]int{}}
+	var advanced []int
+	for _, idx := range targets {
+		it := &t.Items[idx]
+		step := it.CurrentStep
+		ch.NewDecisions = append(ch.NewDecisions, store.Decision{
+			ItemIndex: idx, Step: step, ApproverIss: approver.Iss, ApproverSub: approver.Sub,
+			Decision: decision, Comment: comment, DecidedAt: now, ApprovedUntil: override,
+		})
+		if decision == store.DecisionDeny {
+			it.Status, ch.ItemStatus[idx] = store.StatusDenied, store.StatusDenied
+			continue
+		}
+		approvals := 1
+		for _, d := range t.Decisions {
+			if d.ItemIndex == idx && d.Step == step && d.Decision == store.DecisionApprove {
+				approvals++
 			}
 		}
-		return out
+		if approvals < t.Workflow.Steps[step].Required {
+			continue
+		}
+		if step+1 < len(t.Workflow.Steps) {
+			it.CurrentStep, ch.ItemStep[idx] = step+1, step+1
+			advanced = append(advanced, idx)
+			continue
+		}
+		a := s.newApproval(t, idx, now, shortestOverride(t, idx, override))
+		ch.NewApprovals = append(ch.NewApprovals, a)
+		it.Status, ch.ItemStatus[idx] = store.StatusApproved, store.StatusApproved
+		ch.ItemApproval[idx] = a.ID
 	}
-	return []string{}
+	ch.Status = store.Aggregate(t.Items)
+	step := store.EarliestStep(t.Items)
+	ch.CurrentStep = &step
+	if store.IsTerminal(ch.Status) {
+		ch.CompletedAt = &now
+	}
+	return ch, advanced
 }
 
 // handleRevoke serves POST /access/v1/admin/approvals/{id}/revoke. The next

@@ -14,16 +14,38 @@ import (
 	"github.com/google/uuid"
 )
 
-// submission is a parsed single-item Access Request.
+// submission is a parsed Access Request: one item, or several when the
+// body carried `items` (Bulk Profile).
 type submission struct {
 	Subject         map[string]any
-	Resource        map[string]any
-	Action          map[string]any
 	Context         map[string]any
 	RequestedAccess map[string]any
 	Client          map[string]any
-	denial          denialEcho
-	body            map[string]any
+	Items           []subItem
+	Bulk            bool
+	Callback        *store.Callback
+	// denial is the top-level denial; nil when every item carries its own.
+	denial *denialEcho
+	// actor is the verified client.actor, set after authentication.
+	actor map[string]any
+	body  map[string]any
+}
+
+// subItem is one requested Resource and Action.
+type subItem struct {
+	Resource        map[string]any
+	Action          map[string]any
+	RequestedAccess map[string]any
+	// denial is the item's own denial, if it carries one.
+	denial *denialEcho
+}
+
+// denialFor is the denial binding an item: its own, else the top-level one.
+func (s *submission) denialFor(it *subItem) *denialEcho {
+	if it.denial != nil {
+		return it.denial
+	}
+	return s.denial
 }
 
 // denialEcho is the submission's `denial` object (ARAP "The denial Object").
@@ -36,6 +58,23 @@ type denialEcho struct {
 	Template     string `json:"template,omitempty"`
 }
 
+// parseDenial decodes a `denial` object. This service binds denials by a
+// PDP-signed token only.
+func parseDenial(raw any, name string) (*denialEcho, string) {
+	b, _ := json.Marshal(raw)
+	d := &denialEcho{}
+	if _, ok := raw.(map[string]any); !ok || json.Unmarshal(b, d) != nil {
+		return nil, name + " must be an object of strings"
+	}
+	if d.ExpiresAt == "" {
+		return nil, name + ".expires_at is required"
+	}
+	if d.BindingToken == "" {
+		return nil, name + ".binding_token is required"
+	}
+	return d, ""
+}
+
 // parseSubmission decodes and validates the body. It returns the problem to
 // report, if any: (status, type, detail).
 func (s *Service) parseSubmission(r *http.Request) (*submission, int, string, string) {
@@ -44,52 +83,98 @@ func (s *Service) parseSubmission(r *http.Request) (*submission, int, string, st
 	if err := dec.Decode(&body); err != nil || body == nil {
 		return nil, http.StatusBadRequest, problemGeneric, "the body must be a JSON object"
 	}
-	if _, ok := body["items"]; ok {
-		return nil, http.StatusBadRequest, problemGeneric, "items is not supported"
-	}
-	if _, ok := body["callback"]; ok {
-		// The Callback Profile treats the Task Status Endpoint as
-		// authoritative, so a PEP that also polls loses nothing.
-		s.d.Logger.Warn("AuthZEN access request: callback is not supported in this version and was ignored")
+	bad := func(detail string) (*submission, int, string, string) {
+		return nil, http.StatusBadRequest, problemGeneric, detail
 	}
 	sub := &submission{body: body}
 	var problem string
 	if sub.Subject, problem = entity(body, "subject", "type", "id"); problem != "" {
-		return nil, http.StatusBadRequest, problemGeneric, problem
-	}
-	if sub.Resource, problem = entity(body, "resource", "type", "id"); problem != "" {
-		return nil, http.StatusBadRequest, problemGeneric, problem
-	}
-	if sub.Action, problem = entity(body, "action", "name"); problem != "" {
-		return nil, http.StatusBadRequest, problemGeneric, problem
+		return bad(problem)
 	}
 	for name, dst := range map[string]*map[string]any{"context": &sub.Context, "requested_access": &sub.RequestedAccess, "client": &sub.Client} {
-		v, ok := body[name]
-		if !ok || v == nil {
-			continue
+		if *dst, problem = object(body, name); problem != "" {
+			return bad(problem)
 		}
-		m, ok := v.(map[string]any)
-		if !ok {
-			return nil, http.StatusBadRequest, problemGeneric, name + " must be a JSON object"
+	}
+
+	if raw, bulk := body["items"]; bulk {
+		_, hasResource := body["resource"]
+		_, hasAction := body["action"]
+		if hasResource || hasAction {
+			return bad("resource and action must be omitted when items is present")
 		}
-		*dst = m
+		list, ok := raw.([]any)
+		if !ok || len(list) == 0 {
+			return bad("items must be a non-empty array")
+		}
+		if len(list) > s.d.MaxItems {
+			return bad(fmt.Sprintf("items lists %d items; at most %d are allowed", len(list), s.d.MaxItems))
+		}
+		sub.Bulk = true
+		for i, e := range list {
+			obj, ok := e.(map[string]any)
+			if !ok {
+				return bad(fmt.Sprintf("items[%d] must be a JSON object", i))
+			}
+			var it subItem
+			name := fmt.Sprintf("items[%d]", i)
+			if it.Resource, problem = entity(obj, "resource", "type", "id"); problem != "" {
+				return bad(name + "." + problem)
+			}
+			if it.Action, problem = entity(obj, "action", "name"); problem != "" {
+				return bad(name + "." + problem)
+			}
+			if it.RequestedAccess, problem = object(obj, "requested_access"); problem != "" {
+				return bad(name + "." + problem)
+			}
+			if raw, has := obj["denial"]; has && raw != nil {
+				if it.denial, problem = parseDenial(raw, name+".denial"); problem != "" {
+					return nil, http.StatusBadRequest, ProblemInvalidBinding, problem
+				}
+			}
+			sub.Items = append(sub.Items, it)
+		}
+	} else {
+		var it subItem
+		if it.Resource, problem = entity(body, "resource", "type", "id"); problem != "" {
+			return bad(problem)
+		}
+		if it.Action, problem = entity(body, "action", "name"); problem != "" {
+			return bad(problem)
+		}
+		sub.Items = []subItem{it}
 	}
-	raw, ok := body["denial"]
-	if !ok || raw == nil {
-		return nil, http.StatusBadRequest, ProblemNotRequestable, "the submission carries no denial"
+
+	if raw, has := body["denial"]; has && raw != nil {
+		if sub.denial, problem = parseDenial(raw, "denial"); problem != "" {
+			return nil, http.StatusBadRequest, ProblemInvalidBinding, problem
+		}
 	}
-	b, _ := json.Marshal(raw)
-	if err := json.Unmarshal(b, &sub.denial); err != nil {
-		return nil, http.StatusBadRequest, ProblemInvalidBinding, "denial must be an object of strings"
+	for i := range sub.Items {
+		if sub.denialFor(&sub.Items[i]) == nil {
+			return nil, http.StatusBadRequest, ProblemNotRequestable, "the submission carries no denial"
+		}
 	}
-	if sub.denial.ExpiresAt == "" {
-		return nil, http.StatusBadRequest, ProblemInvalidBinding, "denial.expires_at is required"
-	}
-	// This service binds denials by a PDP-signed token only.
-	if sub.denial.BindingToken == "" {
-		return nil, http.StatusBadRequest, ProblemInvalidBinding, "denial.binding_token is required"
+
+	if raw, has := body["callback"]; has {
+		if sub.Callback, problem = s.parseCallback(r.Context(), raw); problem != "" {
+			return bad(problem)
+		}
 	}
 	return sub, 0, "", ""
+}
+
+// object reads an optional JSON object member; null counts as absent.
+func object(body map[string]any, name string) (map[string]any, string) {
+	v, ok := body[name]
+	if !ok || v == nil {
+		return nil, ""
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, name + " must be a JSON object"
+	}
+	return m, ""
 }
 
 // entity validates an AuthZEN entity member: an object with the named
@@ -125,8 +210,9 @@ func callerInput(id *authn.Identity) map[string]any {
 }
 
 // ruleSubmission is the submission as the caller and workflow rules see it.
-// client.actor and client.source are left out: ARAP forbids relying on them
-// unless verified, which this version does not do.
+// client.actor appears only once verified, flagged actor_verified;
+// client.source never does, since nothing can verify it (ARAP "Submission
+// Processing").
 func ruleSubmission(sub *submission) map[string]any {
 	var client map[string]any
 	if sub.Client != nil {
@@ -136,18 +222,39 @@ func ruleSubmission(sub *submission) map[string]any {
 				client[k] = v
 			}
 		}
+		if sub.actor != nil {
+			client["actor"], client["actor_verified"] = sub.actor, true
+		}
 	}
-	return map[string]any{
+	items := make([]any, len(sub.Items))
+	for i := range sub.Items {
+		it := &sub.Items[i]
+		items[i] = map[string]any{
+			"resource": it.Resource, "action": it.Action,
+			"requested_access": mergeMaps(sub.RequestedAccess, it.RequestedAccess),
+			"denial":           ruleDenial(sub.denialFor(it)),
+		}
+	}
+	out := map[string]any{
 		"subject":          sub.Subject,
-		"items":            []any{map[string]any{"resource": sub.Resource, "action": sub.Action, "requested_access": sub.RequestedAccess}},
+		"items":            items,
+		"bulk":             sub.Bulk,
 		"context":          sub.Context,
 		"requested_access": sub.RequestedAccess,
 		"client":           client,
-		"denial": map[string]any{
-			"template": sub.denial.Template, "reason": sub.denial.Reason,
-			"evaluation_id": sub.denial.EvaluationID, "expires_at": sub.denial.ExpiresAt,
-		},
+		"denial":           ruleDenial(sub.denialFor(&sub.Items[0])),
 	}
+	if sub.denial != nil {
+		out["denial"] = ruleDenial(sub.denial)
+	}
+	if sub.Callback != nil {
+		out["callback"] = map[string]any{"endpoint": sub.Callback.Endpoint, "events": sub.Callback.Events}
+	}
+	return out
+}
+
+func ruleDenial(d *denialEcho) map[string]any {
+	return map[string]any{"template": d.Template, "reason": d.Reason, "evaluation_id": d.EvaluationID, "expires_at": d.ExpiresAt}
 }
 
 // allowed evaluates a boolean authorization rule; anything but true denies.
@@ -167,6 +274,40 @@ func newID(prefix string) string {
 	return prefix + uuid.NewString()
 }
 
+// verifyDenials verifies each item's binding_token. A token may bind only
+// one item. It returns the verified denials, in item order, or the problem.
+func (s *Service) verifyDenials(sub *submission) ([]*verifiedDenial, int, string, string) {
+	out := make([]*verifiedDenial, len(sub.Items))
+	seen := map[string]bool{}
+	for i := range sub.Items {
+		it := &sub.Items[i]
+		claims, err := s.d.Crypto.VerifyBindingToken(sub.denialFor(it).BindingToken)
+		if err != nil {
+			return nil, http.StatusBadRequest, ProblemInvalidBinding, itemDetail(sub, i, "binding_token does not verify")
+		}
+		v, err := s.verifyBinding(claims, sub, it)
+		switch {
+		case errors.Is(err, errExpiredDenial):
+			return nil, http.StatusGone, ProblemExpiredDenial, itemDetail(sub, i, "the denial has expired")
+		case err != nil:
+			return nil, http.StatusBadRequest, ProblemInvalidBinding, itemDetail(sub, i, err.Error())
+		}
+		if seen[v.jti] {
+			return nil, http.StatusBadRequest, ProblemInvalidBinding, itemDetail(sub, i, "binding_token already binds another item")
+		}
+		seen[v.jti] = true
+		out[i] = v
+	}
+	return out, 0, "", ""
+}
+
+func itemDetail(sub *submission, i int, detail string) string {
+	if sub.Bulk {
+		return fmt.Sprintf("items[%d]: %s", i, detail)
+	}
+	return detail
+}
+
 // handleSubmit serves POST /access/v1/requests (ARAP "Access Request
 // Submission").
 func (s *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
@@ -181,19 +322,19 @@ func (s *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, status, typ, "Invalid access request", detail)
 		return
 	}
-
-	claims, err := s.d.Crypto.VerifyBindingToken(sub.denial.BindingToken)
-	if err != nil {
-		writeProblem(w, http.StatusBadRequest, ProblemInvalidBinding, "Invalid denial binding", "binding_token does not verify")
+	// Actor Profile: a claimed chain the caller's credential does not
+	// authorize is rejected.
+	if sub.actor, err = verifyActor(caller, sub); err != nil {
+		writeProblem(w, http.StatusForbidden, problemGeneric, "Actor chain not verified", err.Error())
 		return
 	}
-	denial, err := s.verifyBinding(claims, sub)
-	switch {
-	case errors.Is(err, errExpiredDenial):
-		writeProblem(w, http.StatusGone, ProblemExpiredDenial, "Requestable denial has expired", "")
-		return
-	case err != nil:
-		writeProblem(w, http.StatusBadRequest, ProblemInvalidBinding, "Invalid denial binding", err.Error())
+	denials, status, typ, detail := s.verifyDenials(sub)
+	if denials == nil {
+		title := "Invalid denial binding"
+		if typ == ProblemExpiredDenial {
+			title = "Requestable denial has expired"
+		}
+		writeProblem(w, status, typ, title, detail)
 		return
 	}
 
@@ -216,7 +357,7 @@ func (s *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		internalError(w)
 		return
 	}
-	p, err := parsePlan(raw)
+	p, err := parsePlan(raw, len(sub.Items), s.d.MaxSteps)
 	if err != nil {
 		s.d.Logger.Error("AuthZEN access request: workflow rule result: %v", err)
 		internalError(w)
@@ -224,7 +365,7 @@ func (s *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := s.now()
-	task, approvals := s.buildTask(caller, sub, denial, p, now)
+	task, approvals := s.buildTask(caller, sub, denials, p, now)
 	var idem store.Idempotency
 	if key := r.Header.Get("Idempotency-Key"); key != "" {
 		canon, _ := json.Marshal(sub.body)
@@ -236,12 +377,15 @@ func (s *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			RetainUntil: task.ExpiresAt.Add(s.d.IdempotencyRetention),
 		}
 	}
+	jtis := make([]store.JTI, len(denials))
+	for i, d := range denials {
+		jtis[i] = store.JTI{ID: d.jti, Expires: d.exp.Add(clockSkew)}
+	}
 	stored, existed, err := s.d.Store.CreateTask(ctx, &store.NewTask{
 		Task:        task,
 		Approvals:   approvals,
 		Idempotency: idem,
-		JTI:         denial.jti,
-		JTIExpires:  denial.exp.Add(clockSkew),
+		JTIs:        jtis,
 	}, now)
 	switch {
 	case errors.Is(err, store.ErrDuplicateRequest):
@@ -265,9 +409,14 @@ func (s *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 }
 
 // buildTask turns a verified submission and its plan into a task, and into
-// the approval when the plan auto-approves.
-func (s *Service) buildTask(caller *authn.Identity, sub *submission, denial *verifiedDenial, p *plan, now time.Time) (*store.Task, []*store.Approval) {
-	evalID, _ := denial.claims["evaluation_id"].(string)
+// the approvals of the items the plan auto-approves.
+func (s *Service) buildTask(caller *authn.Identity, sub *submission, denials []*verifiedDenial, p *plan, now time.Time) (*store.Task, []*store.Approval) {
+	first := denials[0].record()
+	evalID, _ := first["evaluation_id"].(string)
+	template := denials[0].echo.Template
+	if sub.denial != nil && sub.denial.Template != "" {
+		template = sub.denial.Template
+	}
 	t := &store.Task{
 		ID:              newID("arq_"),
 		Status:          store.StatusPending,
@@ -278,41 +427,75 @@ func (s *Service) buildTask(caller *authn.Identity, sub *submission, denial *ver
 		Context:         sub.Context,
 		RequestedAccess: sub.RequestedAccess,
 		Client:          sub.Client,
-		Denial: map[string]any{
-			"expires_at": sub.denial.ExpiresAt, "evaluation_id": evalID, "evaluated_at": sub.denial.EvaluatedAt,
-			"reason": sub.denial.Reason, "template": sub.denial.Template,
-			"binding_context_members": denial.members, "context": denial.claims["context"],
-		},
-		Template:     sub.denial.Template,
-		EvaluationID: evalID,
-		Workflow:     p.workflow,
-		Display:      p.display,
-		Items: []store.Item{{
-			Index: 0, Resource: sub.Resource, Action: sub.Action,
-			RequestedAccess: sub.RequestedAccess, Status: store.StatusPending,
-		}},
-		ExpiresAt: now.Add(s.d.TaskTTL).Truncate(time.Second),
-		CreatedAt: now,
+		Denial:          first,
+		Template:        template,
+		EvaluationID:    evalID,
+		Workflow:        p.workflow,
+		Display:         p.display,
+		Bulk:            sub.Bulk,
+		Callback:        sub.Callback,
+		ExpiresAt:       now.Add(s.d.TaskTTL).Truncate(time.Second),
+		CreatedAt:       now,
+	}
+	for i, it := range sub.Items {
+		t.Items = append(t.Items, store.Item{
+			Index: i, Resource: it.Resource, Action: it.Action, RequestedAccess: it.RequestedAccess,
+			Status: store.StatusPending, Denial: denials[i].record(),
+		})
 	}
 	var approvals []*store.Approval
-	switch p.auto {
-	case store.DecisionApprove:
-		a := s.newApproval(t, 0, denial.members, now, nil)
-		approvals = append(approvals, a)
-		t.Status, t.Items[0].Status, t.Items[0].ApprovalID = store.StatusApproved, store.StatusApproved, a.ID
-		t.CompletedAt = &now
-	case store.DecisionDeny:
-		t.Status, t.Items[0].Status = store.StatusDenied, store.StatusDenied
+	for i, auto := range p.auto {
+		switch auto {
+		case store.DecisionApprove:
+			a := s.newApproval(t, i, now, nil)
+			approvals = append(approvals, a)
+			t.Items[i].Status, t.Items[i].ApprovalID = store.StatusApproved, a.ID
+		case store.DecisionDeny:
+			t.Items[i].Status = store.StatusDenied
+		}
+	}
+	t.Status = store.Aggregate(t.Items)
+	if store.IsTerminal(t.Status) {
 		t.CompletedAt = &now
 	}
 	return t, approvals
 }
 
+// itemBinding is what an item's approval is scoped to beyond the subject,
+// resource and action: the denial's binding context members and the bound
+// context. Tasks stored before denials were kept per item use the task's.
+func itemBinding(t *store.Task, item int) ([]string, map[string]any) {
+	d := t.Items[item].Denial
+	if d == nil {
+		d = t.Denial
+	}
+	ctx, _ := d["context"].(map[string]any)
+	return stringList(d["binding_context_members"]), ctx
+}
+
+// stringList reads a list of strings that JSON round trips may leave as
+// []any.
+func stringList(v any) []string {
+	switch m := v.(type) {
+	case []string:
+		return m
+	case []any:
+		out := make([]string, 0, len(m))
+		for _, v := range m {
+			if s, ok := v.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return []string{}
+}
+
 // newApproval records what an approved item grants: the denied request it
 // was bound to, with the actor removed, and its lifetime.
-func (s *Service) newApproval(t *store.Task, item int, members []string, now time.Time, override *time.Time) *store.Approval {
+func (s *Service) newApproval(t *store.Task, item int, now time.Time, override *time.Time) *store.Approval {
 	it := t.Items[item]
-	ctxMap, _ := t.Denial["context"].(map[string]any)
+	members, ctxMap := itemBinding(t, item)
 	return &store.Approval{
 		ID:                    newID("apr_"),
 		TaskID:                t.ID,
@@ -323,22 +506,18 @@ func (s *Service) newApproval(t *store.Task, item int, members []string, now tim
 		BindingContextMembers: members,
 		Context:               ctxMap,
 		ApprovedAt:            now.Truncate(time.Second),
-		ApprovedUntil:         s.approvedUntil(t, now, override),
+		ApprovedUntil:         s.approvedUntil(t, item, now, override),
 	}
 }
 
-// writeTask writes a task handle and, for an approved task, its result.
-// From submission, a terminal task is 201 and a pending one 202.
+// writeTask writes a task handle with its results. From submission, a
+// terminal task is 201 and a pending one 202.
 func (s *Service) writeTask(ctx context.Context, w http.ResponseWriter, t *store.Task, fromSubmit bool) {
-	res, err := s.result(ctx, t)
+	body, err := s.render(ctx, t)
 	if err != nil {
 		s.d.Logger.Error("AuthZEN access request: building result: %v", err)
 		internalError(w)
 		return
-	}
-	body := map[string]any{"task": s.taskHandle(t)}
-	if res != nil {
-		body["result"] = res
 	}
 	status := http.StatusOK
 	if fromSubmit {
@@ -397,7 +576,8 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCancel serves POST and DELETE /access/v1/requests/{id}/cancel (ARAP
-// "Cancellation").
+// "Cancellation"). Pending items are cancelled and completed ones kept, so
+// a bulk task with items completed first becomes partial.
 func (s *Service) handleCancel(w http.ResponseWriter, r *http.Request) {
 	t, caller, ok := s.loadAuthorized(w, r, "cancel")
 	if !ok {
@@ -418,13 +598,14 @@ func (s *Service) handleCancel(w http.ResponseWriter, r *http.Request) {
 		if store.IsTerminal(cur.Status) {
 			return nil, store.ErrConflict
 		}
-		items := map[int]string{}
-		for _, it := range cur.Items {
-			if it.Status == store.StatusPending {
-				items[it.Index] = store.StatusCancelled
+		statuses := map[int]string{}
+		for i := range cur.Items {
+			if cur.Items[i].Status == store.StatusPending {
+				cur.Items[i].Status = store.StatusCancelled
+				statuses[cur.Items[i].Index] = store.StatusCancelled
 			}
 		}
-		return &store.Change{Status: store.StatusCancelled, CompletedAt: &now, ItemStatus: items}, nil
+		return &store.Change{Status: store.Aggregate(cur.Items), CompletedAt: &now, ItemStatus: statuses}, nil
 	})
 	switch {
 	case errors.Is(err, store.ErrConflict):
@@ -438,10 +619,11 @@ func (s *Service) handleCancel(w http.ResponseWriter, r *http.Request) {
 	attrs := s.auditTask(updated, caller)
 	attrs["reason"], attrs["comment"] = body.Reason, body.Comment
 	s.d.Audit.Emit(r.Context(), "cancelled", attrs)
-	writeJSON(w, http.StatusOK, map[string]any{"task": s.taskHandle(updated)})
+	s.writeTask(r.Context(), w, updated, false)
 }
 
-// auditTask is the common content of an audit record about a task.
+// auditTask is the common content of an audit record about a task. A bulk
+// task lists its items; a single-item task names its resource and action.
 func (s *Service) auditTask(t *store.Task, actor *authn.Identity) map[string]any {
 	attrs := map[string]any{
 		"task_id":       t.ID,
@@ -450,7 +632,20 @@ func (s *Service) auditTask(t *store.Task, actor *authn.Identity) map[string]any
 		"subject":       t.Subject,
 		"requester":     t.RequesterIss + "|" + t.RequesterSub,
 	}
-	if len(t.Items) > 0 {
+	if a, ok := t.Client["actor"]; ok {
+		attrs["client_actor"] = a
+	}
+	if src, ok := t.Client["source"]; ok {
+		attrs["client_source"] = src
+	}
+	switch {
+	case t.Bulk:
+		items := make([]any, len(t.Items))
+		for i, it := range t.Items {
+			items[i] = map[string]any{"idx": it.Index, "resource": it.Resource, "action": it.Action, "status": it.Status, "approval_id": it.ApprovalID}
+		}
+		attrs["items"] = items
+	case len(t.Items) > 0:
 		attrs["resource"], attrs["action"] = t.Items[0].Resource, t.Items[0].Action
 		if t.Items[0].ApprovalID != "" {
 			attrs["approval_id"] = t.Items[0].ApprovalID
@@ -458,6 +653,8 @@ func (s *Service) auditTask(t *store.Task, actor *authn.Identity) map[string]any
 	}
 	if actor != nil {
 		attrs["actor"] = actor.Key()
+	} else {
+		attrs["actor"] = "system"
 	}
 	return attrs
 }

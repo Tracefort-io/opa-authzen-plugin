@@ -85,15 +85,30 @@ type Deps struct {
 	TaskTTL              time.Duration
 	MaxApprovalTTL       time.Duration
 	IdempotencyRetention time.Duration
-	Logger               logging.Logger
-	Audit                Auditor
-	Now                  func() time.Time
+	// MaxItems bounds a bulk submission's items; MaxSteps a workflow's
+	// steps. Zero means the default.
+	MaxItems int
+	MaxSteps int
+	// Callbacks enables the Callback Profile; nil rejects `callback`.
+	Callbacks *CallbackConfig
+	Logger    logging.Logger
+	Audit     Auditor
+	Now       func() time.Time
 }
+
+// Defaults for unset Deps.
+const (
+	DefaultMaxItems            = 50
+	DefaultMaxSteps            = 10
+	DefaultCallbackTimeout     = 5 * time.Second
+	DefaultCallbackMaxAttempts = 8
+)
 
 // Service serves the Access Request Service and approver APIs.
 type Service struct {
-	d      Deps
-	routes map[string]http.HandlerFunc
+	d              Deps
+	routes         map[string]http.HandlerFunc
+	callbackClient *http.Client
 }
 
 // RoutePatterns lists the ServeMux patterns the service serves, so routes
@@ -116,7 +131,7 @@ func (s *Service) Handler(pattern string) http.HandlerFunc {
 }
 
 // New returns a Service. Unset Audit, Logger and Now get no-op or real
-// defaults.
+// defaults, and unset limits the Default values.
 func New(deps *Deps) *Service {
 	d := *deps
 	if d.Audit == nil {
@@ -128,7 +143,24 @@ func New(deps *Deps) *Service {
 	if d.Now == nil {
 		d.Now = time.Now
 	}
+	if d.MaxItems <= 0 {
+		d.MaxItems = DefaultMaxItems
+	}
+	if d.MaxSteps <= 0 {
+		d.MaxSteps = DefaultMaxSteps
+	}
 	s := &Service{d: d}
+	if d.Callbacks != nil {
+		cb := *d.Callbacks
+		if cb.Timeout <= 0 {
+			cb.Timeout = DefaultCallbackTimeout
+		}
+		if cb.MaxAttempts <= 0 {
+			cb.MaxAttempts = DefaultCallbackMaxAttempts
+		}
+		s.d.Callbacks = &cb
+		s.callbackClient = newCallbackClient(&cb)
+	}
 	s.routes = s.Routes()
 	return s
 }

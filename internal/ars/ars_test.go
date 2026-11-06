@@ -22,9 +22,14 @@ import (
 )
 
 const (
-	baseURL   = "https://pdp.example.com"
-	idpIssuer = "https://idp.example.com"
+	baseURL      = "https://pdp.example.com"
+	idpIssuer    = "https://idp.example.com"
+	agentsIssuer = "https://agents.example.com"
 )
+
+// agentAct is the RFC 8693 act claim of the agent acting for alice; the
+// caller's token carries it, so submissions may claim it.
+func agentAct() map[string]any { return map[string]any{"iss": agentsIssuer, "sub": "agent-7"} }
 
 var now = time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 
@@ -155,9 +160,18 @@ func newFixture(t *testing.T) *fixture {
 	return f
 }
 
-// callerToken is an access token for a PEP or agent runtime.
+// callerToken is an access token for a PEP or agent runtime, exchanged
+// (RFC 8693) so that it names the agent acting.
 func (f *fixture) callerToken(t *testing.T, sub string) string {
-	return signJWT(t, f.idpKey, map[string]any{"iss": idpIssuer, "aud": baseURL, "sub": sub, "exp": float64(time.Now().Add(time.Hour).Unix())})
+	return f.callerTokenActing(t, sub, agentAct())
+}
+
+func (f *fixture) callerTokenActing(t *testing.T, sub string, act map[string]any) string {
+	claims := map[string]any{"iss": idpIssuer, "aud": baseURL, "sub": sub, "exp": float64(time.Now().Add(time.Hour).Unix())}
+	if act != nil {
+		claims["act"] = act
+	}
+	return signJWT(t, f.idpKey, claims)
 }
 
 func (f *fixture) approverToken(t *testing.T, sub string) string {
@@ -184,7 +198,7 @@ func bindingClaims() map[string]any {
 
 func (f *fixture) submission(t *testing.T, claims map[string]any) map[string]any {
 	return map[string]any{
-		"subject":  map[string]any{"type": "user", "id": "alice", "properties": map[string]any{"act": map[string]any{"sub": "agent-7"}}},
+		"subject":  map[string]any{"type": "user", "id": "alice", "properties": map[string]any{"act": agentAct()}},
 		"resource": map[string]any{"type": "document", "id": "q4-plan"},
 		"action":   map[string]any{"name": "can_read"},
 		"context":  map[string]any{"project": "renewal", "business_justification": "renewal review"},
@@ -405,7 +419,7 @@ func TestSubmitActorNormalizedToClient(t *testing.T) {
 	claims["subject"] = map[string]any{"type": "user", "id": "alice", "properties": map[string]any{"act": map[string]any{"sub": "agent-7"}}}
 	body := f.submission(t, claims)
 	body["subject"] = map[string]any{"type": "user", "id": "alice"}
-	body["client"] = map[string]any{"actor": map[string]any{"id": "agent-7"}}
+	body["client"] = map[string]any{"actor": map[string]any{"id": "agent-7", "issuer": agentsIssuer, "type": "ai_agent"}}
 	if w := f.do(t, http.MethodPost, RequestsPath, f.callerToken(t, "agent-7"), body); w.Code != http.StatusAccepted {
 		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
 	}
@@ -457,16 +471,68 @@ func TestSubmitAuthAndPolicy(t *testing.T) {
 	}
 }
 
-func TestCallerRuleSeesNoUnverifiedActor(t *testing.T) {
+// A verified actor chain reaches the rules, flagged; client.source never
+// does, since nothing can verify it.
+func TestCallerRuleSeesVerifiedActorOnly(t *testing.T) {
 	f := newFixture(t)
 	var seen map[string]any
 	f.rules["ars_caller"] = func(in map[string]any) any { seen = in; return true }
 	body := f.submission(t, bindingClaims())
-	body["client"] = map[string]any{"id": "app", "actor": map[string]any{"id": "agent"}, "source": map[string]any{"session_id": "s"}}
-	f.do(t, http.MethodPost, RequestsPath, f.callerToken(t, "agent-7"), body)
+	body["client"] = map[string]any{"id": "app", "actor": map[string]any{"id": "agent-7", "issuer": agentsIssuer}, "source": map[string]any{"session_id": "s"}}
+	if w := f.do(t, http.MethodPost, RequestsPath, f.callerToken(t, "agent-7"), body); w.Code != http.StatusAccepted {
+		t.Fatalf("submit: %d %s", w.Code, w.Body.String())
+	}
 	client := seen["submission"].(map[string]any)["client"].(map[string]any)
-	if client["id"] != "app" || client["actor"] != nil || client["source"] != nil {
+	if client["id"] != "app" || client["actor_verified"] != true || client["actor"].(map[string]any)["id"] != "agent-7" || client["source"] != nil {
 		t.Fatalf("rule saw %v", client)
+	}
+}
+
+// Actor Profile "Actor Chain Verification": a claimed chain must equal the
+// caller token's act chain, link for link.
+func TestActorChainVerification(t *testing.T) {
+	f := newFixture(t)
+	nested := map[string]any{"iss": agentsIssuer, "sub": "agent-7", "act": map[string]any{"iss": idpIssuer, "sub": "orchestrator"}}
+	withActor := func(actor map[string]any, subjectAct any) map[string]any {
+		claims := bindingClaims()
+		claims["jti"] = newID("jti_")
+		b := f.submission(t, claims)
+		if subjectAct == nil {
+			b["subject"] = map[string]any{"type": "user", "id": "alice"}
+		} else {
+			b["subject"].(map[string]any)["properties"] = map[string]any{"act": subjectAct}
+		}
+		if actor != nil {
+			b["client"] = map[string]any{"actor": actor}
+		}
+		return b
+	}
+	cases := map[string]struct {
+		token  map[string]any // the caller token's act
+		body   map[string]any
+		status int
+	}{
+		"matching client.actor":    {agentAct(), withActor(map[string]any{"id": "agent-7", "issuer": agentsIssuer}, nil), 202},
+		"matching subject act":     {agentAct(), withActor(nil, agentAct()), 202},
+		"both carriers agree":      {agentAct(), withActor(map[string]any{"id": "agent-7", "issuer": agentsIssuer}, agentAct()), 202},
+		"nested chain matches":     {nested, withActor(map[string]any{"id": "agent-7", "issuer": agentsIssuer, "act": map[string]any{"iss": idpIssuer, "sub": "orchestrator"}}, nil), 202},
+		"no actor claimed":         {nil, withActor(nil, nil), 202},
+		"other actor":              {agentAct(), withActor(map[string]any{"id": "agent-8", "issuer": agentsIssuer}, nil), 403},
+		"other issuer":             {agentAct(), withActor(map[string]any{"id": "agent-7", "issuer": "https://elsewhere"}, nil), 403},
+		"no issuer":                {agentAct(), withActor(map[string]any{"id": "agent-7"}, nil), 403},
+		"token has no act":         {nil, withActor(map[string]any{"id": "agent-7", "issuer": agentsIssuer}, nil), 403},
+		"chain shorter than token": {nested, withActor(map[string]any{"id": "agent-7", "issuer": agentsIssuer}, nil), 403},
+		"chain longer than token":  {agentAct(), withActor(map[string]any{"id": "agent-7", "issuer": agentsIssuer, "act": map[string]any{"iss": idpIssuer, "sub": "orchestrator"}}, nil), 403},
+		"subject act mismatch":     {agentAct(), withActor(nil, map[string]any{"iss": agentsIssuer, "sub": "agent-8"}), 403},
+		"subject act not object":   {agentAct(), withActor(nil, "agent-7"), 403},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			w := f.do(t, http.MethodPost, RequestsPath, f.callerTokenActing(t, "agent-7", c.token), c.body)
+			if w.Code != c.status {
+				t.Fatalf("expected %d, got %d: %s", c.status, w.Code, w.Body.String())
+			}
+		})
 	}
 }
 

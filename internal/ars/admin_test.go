@@ -3,6 +3,7 @@ package ars
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -17,6 +18,13 @@ func (f *fixture) submitPending(t *testing.T, jti string) string {
 		t.Fatalf("submit: %d %s", w.Code, w.Body.String())
 	}
 	return decode(t, w)["task"].(map[string]any)["id"].(string)
+}
+
+// adminItem is item i of the task in an approver API response.
+func adminItem(t *testing.T, w *httptest.ResponseRecorder, i int) map[string]any {
+	t.Helper()
+	items := decode(t, w)["task"].(map[string]any)["request"].(map[string]any)["items"].([]any)
+	return items[i].(map[string]any)
 }
 
 func TestAdminListOnlyCandidates(t *testing.T) {
@@ -99,8 +107,12 @@ func TestAdminDecisionAuthorization(t *testing.T) {
 	if w := f.do(t, http.MethodPost, path, f.approverToken(t, "manager"), map[string]any{"decision": "maybe"}); w.Code != http.StatusBadRequest {
 		t.Fatalf("bad decision: %d", w.Code)
 	}
-	if w := f.do(t, http.MethodPost, path, f.approverToken(t, "manager"), map[string]any{"decision": "approve", "items": []any{0}}); w.Code != http.StatusBadRequest {
-		t.Fatalf("items: %d", w.Code)
+	f.rules["ars_approver"] = func(map[string]any) any { return true }
+	if w := f.do(t, http.MethodPost, path, f.approverToken(t, "manager"), map[string]any{"decision": "approve", "items": []any{5}}); w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown item: %d", w.Code)
+	}
+	if w := f.do(t, http.MethodPost, path, f.approverToken(t, "manager"), map[string]any{"decision": "approve", "items": []any{}}); w.Code != http.StatusBadRequest {
+		t.Fatalf("empty items: %d", w.Code)
 	}
 	if got, _ := f.store.GetTask(context.Background(), id); got.Status != "pending" || len(got.Decisions) != 0 {
 		t.Fatalf("a rejected decision changed the task: %+v", got)
@@ -134,7 +146,7 @@ func TestAdminRevoke(t *testing.T) {
 	f := newFixture(t)
 	id := f.submitPending(t, "j1")
 	w := f.do(t, http.MethodPost, AdminPath+"/tasks/"+id+"/decisions", f.approverToken(t, "manager"), map[string]any{"decision": "approve"})
-	approvalID := decode(t, w)["task"].(map[string]any)["item"].(map[string]any)["approval_id"].(string)
+	approvalID := adminItem(t, w, 0)["approval_id"].(string)
 	path := AdminPath + "/approvals/" + approvalID + "/revoke"
 
 	f.rules["ars_approver"] = func(in map[string]any) any { return in["operation"] != "revoke" }

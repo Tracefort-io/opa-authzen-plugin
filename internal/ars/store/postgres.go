@@ -199,8 +199,9 @@ func (p *Postgres) createTaskOnce(ctx context.Context, n *NewTask, now time.Time
 		}
 	}
 
-	if n.JTI != "" {
-		tag, err := tx.Exec(ctx, "INSERT INTO seen_jti (jti, expires_at) VALUES ($1, $2) ON CONFLICT DO NOTHING", n.JTI, n.JTIExpires)
+	// A token seen before, or twice in this submission, is a replay.
+	for _, j := range n.JTIs {
+		tag, err := tx.Exec(ctx, "INSERT INTO seen_jti (jti, expires_at) VALUES ($1, $2) ON CONFLICT DO NOTHING", j.ID, j.Expires)
 		if err != nil {
 			return nil, false, err
 		}
@@ -212,21 +213,26 @@ func (p *Postgres) createTaskOnce(ctx context.Context, n *NewTask, now time.Time
 	t := n.Task
 	if _, err := tx.Exec(ctx, `INSERT INTO tasks (id, status, version, requester_iss, requester_sub, requester_client,
 			subject, context, requested_access, client, denial, template, evaluation_id, workflow, current_step,
-			display, expires_at, created_at, completed_at)
+			display, bulk, callback, expires_at, created_at, completed_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12, $13, $14::jsonb,
-			$15, $16::jsonb, $17, $18, $19)`,
+			$15, $16::jsonb, $17, $18::jsonb, $19, $20, $21)`,
 		t.ID, t.Status, t.Version, t.RequesterIss, t.RequesterSub, t.RequesterClient,
 		jsonArg(t.Subject), jsonArg(t.Context), jsonArg(t.RequestedAccess), jsonArg(t.Client), jsonArg(t.Denial),
 		t.Template, t.EvaluationID, jsonArg(t.Workflow), t.CurrentStep, jsonArg(t.Display),
-		t.ExpiresAt, t.CreatedAt, t.CompletedAt); err != nil {
+		t.Bulk, callbackArg(t.Callback), t.ExpiresAt, t.CreatedAt, t.CompletedAt); err != nil {
 		return nil, false, err
 	}
 	for _, it := range t.Items {
-		if _, err := tx.Exec(ctx, `INSERT INTO task_items (task_id, idx, resource, action, requested_access, status, approval_id)
-			VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6, $7)`,
-			t.ID, it.Index, jsonArg(it.Resource), jsonArg(it.Action), jsonArg(it.RequestedAccess), it.Status, it.ApprovalID); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO task_items (task_id, idx, resource, action, requested_access, status, approval_id,
+				current_step, denial)
+			VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6, $7, $8, $9::jsonb)`,
+			t.ID, it.Index, jsonArg(it.Resource), jsonArg(it.Action), jsonArg(it.RequestedAccess), it.Status, it.ApprovalID,
+			it.CurrentStep, jsonArg(it.Denial)); err != nil {
 			return nil, false, err
 		}
+	}
+	if err := enqueue(ctx, tx, t, now); err != nil {
+		return nil, false, err
 	}
 	for _, a := range n.Approvals {
 		if err := insertApproval(ctx, tx, a); err != nil {
@@ -265,6 +271,25 @@ func nonNilMap(m map[string]any) map[string]any {
 	return m
 }
 
+func callbackArg(c *Callback) any {
+	if c == nil {
+		return nil
+	}
+	return jsonArg(c)
+}
+
+// enqueue inserts the callback notification of a task that has just become
+// terminal, if its callback asked for that status, in the caller's
+// transaction.
+func enqueue(ctx context.Context, tx pgx.Tx, t *Task, now time.Time) error {
+	if !t.Callback.Wants(t.Status) {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO callback_outbox (task_id, event, next_attempt_at, created_at)
+		VALUES ($1, $2, $3, $3)`, t.ID, t.Status, now)
+	return err
+}
+
 type queryer interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
@@ -272,14 +297,14 @@ type queryer interface {
 
 const taskColumns = `id, status, version, requester_iss, requester_sub, requester_client, subject, context,
 	requested_access, client, denial, template, evaluation_id, workflow, current_step, display,
-	expires_at, created_at, completed_at`
+	bulk, callback, expires_at, created_at, completed_at`
 
 func scanTask(row pgx.Row) (*Task, error) {
 	var t Task
-	var subject, ctxJSON, requested, client, denial, workflow, display []byte
+	var subject, ctxJSON, requested, client, denial, workflow, display, callback []byte
 	if err := row.Scan(&t.ID, &t.Status, &t.Version, &t.RequesterIss, &t.RequesterSub, &t.RequesterClient,
 		&subject, &ctxJSON, &requested, &client, &denial, &t.Template, &t.EvaluationID, &workflow,
-		&t.CurrentStep, &display, &t.ExpiresAt, &t.CreatedAt, &t.CompletedAt); err != nil {
+		&t.CurrentStep, &display, &t.Bulk, &callback, &t.ExpiresAt, &t.CreatedAt, &t.CompletedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -297,6 +322,12 @@ func scanTask(row pgx.Row) (*Task, error) {
 	if err := json.Unmarshal(workflow, &t.Workflow); err != nil {
 		return nil, err
 	}
+	if callback != nil {
+		t.Callback = &Callback{}
+		if err := json.Unmarshal(callback, t.Callback); err != nil {
+			return nil, err
+		}
+	}
 	return &t, nil
 }
 
@@ -310,15 +341,19 @@ func loadTask(ctx context.Context, q queryer, id string, lock bool) (*Task, erro
 	if err != nil {
 		return nil, err
 	}
-	rows, err := q.Query(ctx, `SELECT idx, resource, action, requested_access, status, approval_id
+	rows, err := q.Query(ctx, `SELECT idx, resource, action, requested_access, status, approval_id, current_step, denial
 		FROM task_items WHERE task_id = $1 ORDER BY idx`, id)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var it Item
-		var res, act, req []byte
-		if err := rows.Scan(&it.Index, &res, &act, &req, &it.Status, &it.ApprovalID); err != nil {
+		var res, act, req, den []byte
+		if err := rows.Scan(&it.Index, &res, &act, &req, &it.Status, &it.ApprovalID, &it.CurrentStep, &den); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if it.Denial, err = decodeMap(den); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -340,7 +375,7 @@ func loadTask(ctx context.Context, q queryer, id string, lock bool) (*Task, erro
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	rows, err = q.Query(ctx, `SELECT item_idx, step, approver_iss, approver_sub, decision, comment, decided_at
+	rows, err = q.Query(ctx, `SELECT item_idx, step, approver_iss, approver_sub, decision, comment, decided_at, approved_until
 		FROM decisions WHERE task_id = $1 ORDER BY id`, id)
 	if err != nil {
 		return nil, err
@@ -348,7 +383,7 @@ func loadTask(ctx context.Context, q queryer, id string, lock bool) (*Task, erro
 	defer rows.Close()
 	for rows.Next() {
 		var d Decision
-		if err := rows.Scan(&d.ItemIndex, &d.Step, &d.ApproverIss, &d.ApproverSub, &d.Decision, &d.Comment, &d.DecidedAt); err != nil {
+		if err := rows.Scan(&d.ItemIndex, &d.Step, &d.ApproverIss, &d.ApproverSub, &d.Decision, &d.Comment, &d.DecidedAt, &d.ApprovedUntil); err != nil {
 			return nil, err
 		}
 		t.Decisions = append(t.Decisions, d)
@@ -381,36 +416,8 @@ func (p *Postgres) UpdateTask(ctx context.Context, id string, fn func(*Task) (*C
 	if ch == nil {
 		return t, tx.Commit(ctx)
 	}
-	applyChange(t, ch)
-	if _, err := tx.Exec(ctx, `UPDATE tasks SET status = $2, current_step = $3, completed_at = $4, version = $5 WHERE id = $1`,
-		t.ID, t.Status, t.CurrentStep, t.CompletedAt, t.Version); err != nil {
+	if err := saveChange(ctx, tx, t, ch); err != nil {
 		return nil, err
-	}
-	for _, it := range t.Items {
-		_, statusChanged := ch.ItemStatus[it.Index]
-		_, approvalChanged := ch.ItemApproval[it.Index]
-		if !statusChanged && !approvalChanged {
-			continue
-		}
-		if _, err := tx.Exec(ctx, `UPDATE task_items SET status = $3, approval_id = $4 WHERE task_id = $1 AND idx = $2`,
-			t.ID, it.Index, it.Status, it.ApprovalID); err != nil {
-			return nil, err
-		}
-	}
-	for _, d := range ch.NewDecisions {
-		if _, err := tx.Exec(ctx, `INSERT INTO decisions (task_id, item_idx, step, approver_iss, approver_sub, decision, comment, decided_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			t.ID, d.ItemIndex, d.Step, d.ApproverIss, d.ApproverSub, d.Decision, d.Comment, d.DecidedAt); err != nil {
-			if isUniqueViolation(err) {
-				return nil, ErrConflict
-			}
-			return nil, err
-		}
-	}
-	for _, a := range ch.NewApprovals {
-		if err := insertApproval(ctx, tx, a); err != nil {
-			return nil, err
-		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -418,13 +425,62 @@ func (p *Postgres) UpdateTask(ctx context.Context, id string, fn func(*Task) (*C
 	return t, nil
 }
 
+// saveChange applies ch to t, a task locked in tx, and persists it; a task
+// it makes terminal gets its callback notification enqueued.
+func saveChange(ctx context.Context, tx pgx.Tx, t *Task, ch *Change) error {
+	wasPending := t.Status == StatusPending
+	applyChange(t, ch)
+	if _, err := tx.Exec(ctx, `UPDATE tasks SET status = $2, current_step = $3, completed_at = $4, version = $5 WHERE id = $1`,
+		t.ID, t.Status, t.CurrentStep, t.CompletedAt, t.Version); err != nil {
+		return err
+	}
+	for _, it := range t.Items {
+		_, statusChanged := ch.ItemStatus[it.Index]
+		_, approvalChanged := ch.ItemApproval[it.Index]
+		_, stepChanged := ch.ItemStep[it.Index]
+		if !statusChanged && !approvalChanged && !stepChanged {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `UPDATE task_items SET status = $3, approval_id = $4, current_step = $5 WHERE task_id = $1 AND idx = $2`,
+			t.ID, it.Index, it.Status, it.ApprovalID, it.CurrentStep); err != nil {
+			return err
+		}
+	}
+	for _, d := range ch.NewDecisions {
+		if _, err := tx.Exec(ctx, `INSERT INTO decisions (task_id, item_idx, step, approver_iss, approver_sub, decision, comment,
+				decided_at, approved_until)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			t.ID, d.ItemIndex, d.Step, d.ApproverIss, d.ApproverSub, d.Decision, d.Comment, d.DecidedAt, d.ApprovedUntil); err != nil {
+			if isUniqueViolation(err) {
+				return ErrConflict
+			}
+			return err
+		}
+	}
+	for _, a := range ch.NewApprovals {
+		if err := insertApproval(ctx, tx, a); err != nil {
+			return err
+		}
+	}
+	if wasPending && IsTerminal(t.Status) {
+		var at time.Time
+		if t.CompletedAt != nil {
+			at = *t.CompletedAt
+		}
+		return enqueue(ctx, tx, t, at)
+	}
+	return nil
+}
+
 // ListPending implements Store.
 func (p *Postgres) ListPending(ctx context.Context, approverID, after string, limit int) ([]*Task, string, error) {
 	match, _ := json.Marshal([]map[string]string{{"type": "user", "id": approverID}})
-	rows, err := p.pool.Query(ctx, `SELECT id FROM tasks
-		WHERE status = 'pending' AND id > $1
-		  AND workflow->'steps'->current_step->'approvers' @> $2::jsonb
-		ORDER BY id LIMIT $3`, after, string(match), limit+1)
+	rows, err := p.pool.Query(ctx, `SELECT t.id FROM tasks t
+		WHERE t.status = 'pending' AND t.id > $1
+		  AND EXISTS (SELECT 1 FROM task_items i
+		              WHERE i.task_id = t.id AND i.status = 'pending'
+		                AND t.workflow->'steps'->i.current_step->'approvers' @> $2::jsonb)
+		ORDER BY t.id LIMIT $3`, after, string(match), limit+1)
 	if err != nil {
 		return nil, "", err
 	}
@@ -505,43 +561,119 @@ func (p *Postgres) RevokeApproval(ctx context.Context, id, by, reason string, no
 
 // ExpireDue implements Store. SKIP LOCKED lets every replica sweep at once
 // without claiming the same task or waiting on a task being decided.
-func (p *Postgres) ExpireDue(ctx context.Context, now time.Time, limit int) ([]string, error) {
+func (p *Postgres) ExpireDue(ctx context.Context, now time.Time, limit int) ([]*Task, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	rows, err := tx.Query(ctx, `WITH due AS (
-			SELECT id FROM tasks WHERE status = 'pending' AND expires_at <= $1
-			ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED)
-		UPDATE tasks t SET status = 'expired', completed_at = $1, version = t.version + 1
-		FROM due WHERE t.id = due.id RETURNING t.id`, now, limit)
+	ids, err := queryIDs(ctx, tx, `SELECT id FROM tasks WHERE status = 'pending' AND expires_at <= $1
+		ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED`, now, limit)
 	if err != nil {
 		return nil, err
 	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
+	sort.Strings(ids)
+	out := make([]*Task, 0, len(ids))
+	for _, id := range ids {
+		// The row is locked by the claim above.
+		t, err := loadTask(ctx, tx, id, false)
+		if err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if len(ids) > 0 {
-		if _, err := tx.Exec(ctx, `UPDATE task_items SET status = 'expired' WHERE task_id = ANY($1) AND status = 'pending'`, ids); err != nil {
+		if err := saveChange(ctx, tx, t, expireChange(t, now)); err != nil {
 			return nil, err
 		}
+		out = append(out, t)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	sort.Strings(ids)
-	return ids, nil
+	return out, nil
+}
+
+func queryIDs(ctx context.Context, q queryer, sql string, args ...any) ([]string, error) {
+	rows, err := q.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ClaimCallbacks implements Store. SKIP LOCKED and the lease keep two
+// replicas from sending the same notification at once.
+func (p *Postgres) ClaimCallbacks(ctx context.Context, now time.Time, lease time.Duration, limit int) ([]Delivery, error) {
+	rows, err := p.pool.Query(ctx, `WITH due AS (
+			SELECT id FROM callback_outbox
+			WHERE delivered_at IS NULL AND failed_at IS NULL AND next_attempt_at <= $1
+			  AND (claimed_until IS NULL OR claimed_until <= $1)
+			ORDER BY next_attempt_at LIMIT $2 FOR UPDATE SKIP LOCKED)
+		UPDATE callback_outbox o SET attempts = o.attempts + 1, claimed_until = $3
+		FROM due WHERE o.id = due.id
+		RETURNING o.id, o.task_id, o.event, o.attempts`, now, limit, now.Add(lease))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Delivery
+	for rows.Next() {
+		var d Delivery
+		if err := rows.Scan(&d.ID, &d.TaskID, &d.Event, &d.Attempts); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// MarkDelivered implements Store.
+func (p *Postgres) MarkDelivered(ctx context.Context, id int64, now time.Time) error {
+	_, err := p.pool.Exec(ctx, `UPDATE callback_outbox SET delivered_at = $2, claimed_until = NULL, last_error = '' WHERE id = $1`, id, now)
+	return err
+}
+
+// RetryCallback implements Store.
+func (p *Postgres) RetryCallback(ctx context.Context, id int64, next time.Time, lastErr string) error {
+	_, err := p.pool.Exec(ctx, `UPDATE callback_outbox SET next_attempt_at = $2, claimed_until = NULL, last_error = $3 WHERE id = $1`, id, next, lastErr)
+	return err
+}
+
+// FailCallback implements Store.
+func (p *Postgres) FailCallback(ctx context.Context, id int64, now time.Time, lastErr string) error {
+	_, err := p.pool.Exec(ctx, `UPDATE callback_outbox SET failed_at = $2, claimed_until = NULL, last_error = $3 WHERE id = $1`, id, now, lastErr)
+	return err
+}
+
+// Purge implements Store. Deleting a task deletes its items, decisions,
+// approvals and callback rows with it (ON DELETE CASCADE).
+func (p *Postgres) Purge(ctx context.Context, c PurgeCutoffs, limit int) (int, error) {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM tasks WHERE id IN (
+			SELECT t.id FROM tasks t
+			WHERE t.status <> 'pending' AND t.expires_at < $1
+			  AND NOT EXISTS (SELECT 1 FROM approvals a WHERE a.task_id = t.id AND a.approved_until >= $2)
+			ORDER BY t.expires_at LIMIT $3 FOR UPDATE SKIP LOCKED)`, c.Tasks, c.Approvals, limit)
+	if err != nil {
+		return 0, err
+	}
+	most := tag.RowsAffected()
+	if tag, err = p.pool.Exec(ctx, `DELETE FROM idempotency_keys WHERE (requester, key) IN (
+			SELECT requester, key FROM idempotency_keys WHERE retain_until < $1 LIMIT $2 FOR UPDATE SKIP LOCKED)`, c.Now, limit); err != nil {
+		return 0, err
+	}
+	most = max(most, tag.RowsAffected())
+	if tag, err = p.pool.Exec(ctx, `DELETE FROM seen_jti WHERE jti IN (
+			SELECT jti FROM seen_jti WHERE expires_at < $1 LIMIT $2 FOR UPDATE SKIP LOCKED)`, c.Now, limit); err != nil {
+		return 0, err
+	}
+	return int(max(most, tag.RowsAffected())), nil
 }
 
 // DropSchemaForTest drops schema and everything in it. Tests only.

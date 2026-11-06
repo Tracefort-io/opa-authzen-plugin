@@ -79,6 +79,41 @@ func TestServiceConfigOverrides(t *testing.T) {
 	}
 }
 
+const callbackSecretEnv = "TEST_CALLBACK_SECRET"
+
+func callbacksConf(destinations ...any) map[string]any {
+	return map[string]any{"destinations": destinations}
+}
+
+func TestServiceConfigCallbacks(t *testing.T) {
+	t.Setenv(defaultDSNEnv, "postgres://u:p@localhost/db")
+	t.Setenv(callbackSecretEnv, strings.Repeat("k", minCallbackSecret))
+	cfg, err := Validate(nil, serviceConf(t, func(c map[string]any) {
+		s := service(c)
+		s["max_items"], s["max_steps"] = 20, 3
+		cb := callbacksConf(map[string]any{"host": "PEP.example.com", "hmac_secret_env": callbackSecretEnv, "allow_internal": true})
+		cb["timeout"], cb["max_attempts"] = "3s", 4
+		s["callbacks"] = cb
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := cfg.AccessRequest.Service
+	cb := s.callbacks
+	if s.MaxItems != 20 || s.MaxSteps != 3 || cb == nil || cb.Timeout != 3*time.Second || cb.MaxAttempts != 4 {
+		t.Fatalf("callbacks: %+v %+v", s, cb)
+	}
+	dest, ok := cb.Destinations["pep.example.com"]
+	if !ok || !dest.AllowInternal || string(dest.Secret) != strings.Repeat("k", minCallbackSecret) {
+		t.Fatalf("destination: %+v", cb.Destinations)
+	}
+	// Without the section, callbacks stay off.
+	cfg, err = Validate(nil, serviceConf(t, nil))
+	if err != nil || cfg.AccessRequest.Service.callbacks != nil {
+		t.Fatalf("callbacks without config: %v %+v", err, cfg.AccessRequest.Service.callbacks)
+	}
+}
+
 func TestServiceConfigRejects(t *testing.T) {
 	t.Setenv(defaultDSNEnv, "postgres://u:p@localhost/db")
 	cases := map[string]func(map[string]any){
@@ -100,7 +135,31 @@ func TestServiceConfigRejects(t *testing.T) {
 		"link not https":   func(c map[string]any) { service(c)["links"] = map[string]any{"ticket": "http://ui.example.com/{id}"} },
 		"foreign endpoint": func(c map[string]any) { c["access_request_endpoint"] = "https://elsewhere.example.com/requests" },
 		"negative conns":   func(c map[string]any) { service(c)["database"] = map[string]any{"max_conns": -1} },
+		"negative items":   func(c map[string]any) { service(c)["max_items"] = -1 },
+		"callbacks without destinations": func(c map[string]any) {
+			service(c)["callbacks"] = map[string]any{"destinations": []any{}}
+		},
+		"callback host with scheme": func(c map[string]any) {
+			service(c)["callbacks"] = callbacksConf(map[string]any{"host": "https://pep.example.com", "hmac_secret_env": callbackSecretEnv})
+		},
+		"callback host listed twice": func(c map[string]any) {
+			d := map[string]any{"host": "pep.example.com", "hmac_secret_env": callbackSecretEnv}
+			service(c)["callbacks"] = callbacksConf(d, d)
+		},
+		"callback secret unset": func(c map[string]any) {
+			service(c)["callbacks"] = callbacksConf(map[string]any{"host": "pep.example.com", "hmac_secret_env": "UNSET_SECRET_VAR"})
+		},
+		"callback secret short": func(c map[string]any) {
+			service(c)["callbacks"] = callbacksConf(map[string]any{"host": "pep.example.com", "hmac_secret_env": "SHORT_SECRET"})
+		},
+		"callback bad timeout": func(c map[string]any) {
+			cb := callbacksConf(map[string]any{"host": "pep.example.com", "hmac_secret_env": callbackSecretEnv})
+			cb["timeout"] = "fast"
+			service(c)["callbacks"] = cb
+		},
 	}
+	t.Setenv(callbackSecretEnv, strings.Repeat("k", minCallbackSecret))
+	t.Setenv("SHORT_SECRET", "too-short")
 	for name, edit := range cases {
 		t.Run(name, func(t *testing.T) {
 			_, err := Validate(nil, serviceConf(t, edit))

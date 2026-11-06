@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"maps"
 	"slices"
 	"sort"
 	"sync"
@@ -18,6 +19,17 @@ type Memory struct {
 	idempotency map[string]Idempotency // requester + "\x00" + key
 	idemTask    map[string]string      // same key -> task id
 	jtis        map[string]time.Time
+	outbox      []*memDelivery
+	nextOutbox  int64
+}
+
+type memDelivery struct {
+	Delivery
+	next      time.Time
+	claimed   time.Time
+	delivered bool
+	failed    bool
+	lastErr   string
 }
 
 // NewMemory returns an empty in-memory store.
@@ -36,6 +48,11 @@ func cloneTask(t *Task) *Task {
 	c.Items = slices.Clone(t.Items)
 	c.Decisions = slices.Clone(t.Decisions)
 	c.Workflow.Steps = slices.Clone(t.Workflow.Steps)
+	if t.Callback != nil {
+		cb := *t.Callback
+		cb.Events = slices.Clone(t.Callback.Events)
+		c.Callback = &cb
+	}
 	return &c
 }
 
@@ -61,11 +78,15 @@ func (m *Memory) CreateTask(_ context.Context, n *NewTask, now time.Time) (*Task
 			}
 		}
 	}
-	if n.JTI != "" {
-		if _, seen := m.jtis[n.JTI]; seen {
+	seen := map[string]bool{}
+	for _, j := range n.JTIs {
+		if _, dup := m.jtis[j.ID]; dup || seen[j.ID] {
 			return nil, false, ErrReplay
 		}
-		m.jtis[n.JTI] = n.JTIExpires
+		seen[j.ID] = true
+	}
+	for _, j := range n.JTIs {
+		m.jtis[j.ID] = j.Expires
 	}
 	t := cloneTask(n.Task)
 	m.tasks[t.ID] = t
@@ -76,7 +97,18 @@ func (m *Memory) CreateTask(_ context.Context, n *NewTask, now time.Time) (*Task
 		m.idempotency[idemKey] = n.Idempotency
 		m.idemTask[idemKey] = t.ID
 	}
+	m.enqueue(t, now)
 	return cloneTask(t), false, nil
+}
+
+// enqueue adds the callback notification of a task that has just become
+// terminal, if its callback asked for that status.
+func (m *Memory) enqueue(t *Task, now time.Time) {
+	if !t.Callback.Wants(t.Status) {
+		return
+	}
+	m.nextOutbox++
+	m.outbox = append(m.outbox, &memDelivery{Delivery: Delivery{ID: m.nextOutbox, TaskID: t.ID, Event: t.Status}, next: now})
 }
 
 // GetTask implements Store.
@@ -113,10 +145,18 @@ func (m *Memory) UpdateTask(_ context.Context, id string, fn func(*Task) (*Chang
 			}
 		}
 	}
+	wasPending := t.Status == StatusPending
 	applyChange(t, ch)
 	m.tasks[id] = t
 	for _, a := range ch.NewApprovals {
 		m.approvals[a.ID] = cloneApproval(a)
+	}
+	if wasPending && IsTerminal(t.Status) {
+		var at time.Time
+		if t.CompletedAt != nil {
+			at = *t.CompletedAt
+		}
+		m.enqueue(t, at)
 	}
 	return cloneTask(t), nil
 }
@@ -141,9 +181,26 @@ func applyChange(t *Task, ch *Change) {
 		if a, ok := ch.ItemApproval[t.Items[i].Index]; ok {
 			t.Items[i].ApprovalID = a
 		}
+		if s, ok := ch.ItemStep[t.Items[i].Index]; ok {
+			t.Items[i].CurrentStep = s
+		}
 	}
 	t.Decisions = append(t.Decisions, ch.NewDecisions...)
 	t.Version++
+}
+
+// expireChange is the change that expires a task's pending items.
+func expireChange(t *Task, now time.Time) *Change {
+	items := slices.Clone(t.Items)
+	status := map[int]string{}
+	for i := range items {
+		if items[i].Status == StatusPending {
+			items[i].Status = StatusExpired
+			status[items[i].Index] = StatusExpired
+		}
+	}
+	at := now
+	return &Change{Status: Aggregate(items), CompletedAt: &at, ItemStatus: status}
 }
 
 // ListPending implements Store.
@@ -152,7 +209,7 @@ func (m *Memory) ListPending(_ context.Context, approverID, after string, limit 
 	defer m.mu.Unlock()
 	var ids []string
 	for id, t := range m.tasks {
-		if t.Status == StatusPending && id > after && currentStepLists(t, approverID) {
+		if t.Status == StatusPending && id > after && pendingStepLists(t, approverID) {
 			ids = append(ids, id)
 		}
 	}
@@ -169,13 +226,15 @@ func (m *Memory) ListPending(_ context.Context, approverID, after string, limit 
 	return out, next, nil
 }
 
-func currentStepLists(t *Task, approverID string) bool {
-	if t.CurrentStep >= len(t.Workflow.Steps) {
-		return false
-	}
-	for _, a := range t.Workflow.Steps[t.CurrentStep].Approvers {
-		if a["type"] == "user" && a["id"] == approverID {
-			return true
+func pendingStepLists(t *Task, approverID string) bool {
+	for _, it := range t.Items {
+		if it.Status != StatusPending || it.CurrentStep >= len(t.Workflow.Steps) {
+			continue
+		}
+		for _, a := range t.Workflow.Steps[it.CurrentStep].Approvers {
+			if a["type"] == "user" && a["id"] == approverID {
+				return true
+			}
 		}
 	}
 	return false
@@ -209,7 +268,7 @@ func (m *Memory) RevokeApproval(_ context.Context, id, by, reason string, now ti
 }
 
 // ExpireDue implements Store.
-func (m *Memory) ExpireDue(_ context.Context, now time.Time, limit int) ([]string, error) {
+func (m *Memory) ExpireDue(_ context.Context, now time.Time, limit int) ([]*Task, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var ids []string
@@ -222,18 +281,118 @@ func (m *Memory) ExpireDue(_ context.Context, now time.Time, limit int) ([]strin
 	if limit > 0 && len(ids) > limit {
 		ids = ids[:limit]
 	}
+	out := make([]*Task, 0, len(ids))
 	for _, id := range ids {
 		t := m.tasks[id]
-		status := map[int]string{}
-		for _, it := range t.Items {
-			if it.Status == StatusPending {
-				status[it.Index] = StatusExpired
-			}
-		}
-		at := now
-		applyChange(t, &Change{Status: StatusExpired, CompletedAt: &at, ItemStatus: status})
+		applyChange(t, expireChange(t, now))
+		m.enqueue(t, now)
+		out = append(out, cloneTask(t))
 	}
-	return ids, nil
+	return out, nil
+}
+
+// ClaimCallbacks implements Store.
+func (m *Memory) ClaimCallbacks(_ context.Context, now time.Time, lease time.Duration, limit int) ([]Delivery, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Delivery
+	for _, d := range m.outbox {
+		if len(out) == limit {
+			break
+		}
+		if d.delivered || d.failed || d.next.After(now) || d.claimed.After(now) {
+			continue
+		}
+		d.Attempts++
+		d.claimed = now.Add(lease)
+		out = append(out, d.Delivery)
+	}
+	return out, nil
+}
+
+func (m *Memory) delivery(id int64) (*memDelivery, error) {
+	for _, d := range m.outbox {
+		if d.ID == id {
+			return d, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+// MarkDelivered implements Store.
+func (m *Memory) MarkDelivered(_ context.Context, id int64, _ time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, err := m.delivery(id)
+	if err == nil {
+		d.delivered = true
+	}
+	return err
+}
+
+// RetryCallback implements Store.
+func (m *Memory) RetryCallback(_ context.Context, id int64, next time.Time, lastErr string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, err := m.delivery(id)
+	if err == nil {
+		d.next, d.claimed, d.lastErr = next, time.Time{}, lastErr
+	}
+	return err
+}
+
+// FailCallback implements Store.
+func (m *Memory) FailCallback(_ context.Context, id int64, _ time.Time, lastErr string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, err := m.delivery(id)
+	if err == nil {
+		d.failed, d.lastErr = true, lastErr
+	}
+	return err
+}
+
+// Purge implements Store.
+func (m *Memory) Purge(_ context.Context, c PurgeCutoffs, limit int) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var ids []string
+	for id, t := range m.tasks {
+		if IsTerminal(t.Status) && t.ExpiresAt.Before(c.Tasks) && !m.approvalInForce(id, c.Approvals) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	if limit > 0 && len(ids) > limit {
+		ids = ids[:limit]
+	}
+	for _, id := range ids {
+		delete(m.tasks, id)
+		maps.DeleteFunc(m.approvals, func(_ string, a *Approval) bool { return a.TaskID == id })
+		m.outbox = slices.DeleteFunc(m.outbox, func(d *memDelivery) bool { return d.TaskID == id })
+	}
+	// Memory deletes every expired key and identifier at once; only tasks
+	// are batched.
+	keys := 0
+	for k, idem := range m.idempotency {
+		if idem.RetainUntil.Before(c.Now) {
+			delete(m.idempotency, k)
+			delete(m.idemTask, k)
+			keys++
+		}
+	}
+	jtis := len(m.jtis)
+	maps.DeleteFunc(m.jtis, func(_ string, exp time.Time) bool { return exp.Before(c.Now) })
+	return max(len(ids), keys, jtis-len(m.jtis)), nil
+}
+
+func (m *Memory) approvalInForce(taskID string, cutoff time.Time) bool {
+	for _, a := range m.approvals {
+		if a.TaskID == taskID && !a.ApprovedUntil.Before(cutoff) {
+			return true
+		}
+	}
+	return false
 }
 
 // Close implements Store.

@@ -99,13 +99,17 @@ func TestStoreConformance(t *testing.T) {
 			t.Run("list pending", func(t *testing.T) { testListPending(t, open(t)) })
 			t.Run("approvals and revocation", func(t *testing.T) { testApprovals(t, open(t)) })
 			t.Run("expire due", func(t *testing.T) { testExpire(t, open(t)) })
+			t.Run("item steps", func(t *testing.T) { testItemSteps(t, open(t)) })
+			t.Run("bulk expiry", func(t *testing.T) { testBulkExpiry(t, open(t)) })
+			t.Run("callbacks", func(t *testing.T) { testCallbacks(t, open(t)) })
+			t.Run("purge", func(t *testing.T) { testPurge(t, open(t)) })
 		})
 	}
 }
 
 func testCreateGet(t *testing.T, s Store) {
 	ctx := context.Background()
-	task, existed, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_1"), JTI: "j1", JTIExpires: t0.Add(time.Hour)}, t0)
+	task, existed, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_1"), JTIs: []JTI{{ID: "j1", Expires: t0.Add(time.Hour)}}}, t0)
 	if err != nil || existed || task.ID != "arq_1" {
 		t.Fatalf("create: %v %v %v", task, existed, err)
 	}
@@ -126,44 +130,223 @@ func testCreateGet(t *testing.T, s Store) {
 func testIdempotency(t *testing.T, s Store) {
 	ctx := context.Background()
 	idem := Idempotency{Requester: "iss|agent-7", Key: "k1", BodyHash: []byte("h1"), RetainUntil: t0.Add(2 * time.Hour)}
-	if _, _, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_a"), Idempotency: idem, JTI: "ja"}, t0); err != nil {
+	if _, _, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_a"), Idempotency: idem, JTIs: []JTI{{ID: "ja"}}}, t0); err != nil {
 		t.Fatal(err)
 	}
 	// Same key and body: the original task, even though the retry carries
 	// a different task id and the same token.
-	got, existed, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_b"), Idempotency: idem, JTI: "ja"}, t0)
+	got, existed, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_b"), Idempotency: idem, JTIs: []JTI{{ID: "ja"}}}, t0)
 	if err != nil || !existed || got.ID != "arq_a" {
 		t.Fatalf("idempotent retry: %v %v %v", got, existed, err)
 	}
 	// Same key, different body.
 	other := idem
 	other.BodyHash = []byte("h2")
-	if _, _, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_c"), Idempotency: other, JTI: "jc"}, t0); !errors.Is(err, ErrDuplicateRequest) {
+	if _, _, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_c"), Idempotency: other, JTIs: []JTI{{ID: "jc"}}}, t0); !errors.Is(err, ErrDuplicateRequest) {
 		t.Fatalf("expected ErrDuplicateRequest, got %v", err)
 	}
 	// After retention the key is reclaimed.
-	got, existed, err = s.CreateTask(ctx, &NewTask{Task: newTask("arq_d"), Idempotency: other, JTI: "jd"}, t0.Add(3*time.Hour))
+	got, existed, err = s.CreateTask(ctx, &NewTask{Task: newTask("arq_d"), Idempotency: other, JTIs: []JTI{{ID: "jd"}}}, t0.Add(3*time.Hour))
 	if err != nil || existed || got.ID != "arq_d" {
 		t.Fatalf("reclaimed key: %v %v %v", got, existed, err)
 	}
 	// Another requester may use the same key.
 	theirs := idem
 	theirs.Requester = "iss|agent-8"
-	if _, existed, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_e"), Idempotency: theirs, JTI: "je"}, t0); err != nil || existed {
+	if _, existed, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_e"), Idempotency: theirs, JTIs: []JTI{{ID: "je"}}}, t0); err != nil || existed {
 		t.Fatalf("keys must be scoped to the requester: %v %v", existed, err)
 	}
 }
 
 func testReplay(t *testing.T, s Store) {
 	ctx := context.Background()
-	if _, _, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_1"), JTI: "same"}, t0); err != nil {
+	if _, _, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_1"), JTIs: []JTI{{ID: "same"}}}, t0); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_2"), JTI: "same"}, t0); !errors.Is(err, ErrReplay) {
+	if _, _, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_2"), JTIs: []JTI{{ID: "same"}}}, t0); !errors.Is(err, ErrReplay) {
 		t.Fatalf("expected ErrReplay, got %v", err)
 	}
 	if _, err := s.GetTask(ctx, "arq_2"); !errors.Is(err, ErrNotFound) {
 		t.Fatal("a replayed submission must store nothing")
+	}
+	// One token on two items of the same submission is a replay too.
+	if _, _, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_3"), JTIs: []JTI{{ID: "twice"}, {ID: "twice"}}}, t0); !errors.Is(err, ErrReplay) {
+		t.Fatalf("expected ErrReplay for a repeated token, got %v", err)
+	}
+}
+
+// bulkTask is a two-item, two-step task with a callback.
+func bulkTask(id string) *Task {
+	task := newTask(id)
+	task.Bulk = true
+	task.Callback = &Callback{Endpoint: "https://pep.example.com/cb", State: "s1"}
+	task.Workflow.Steps = append(task.Workflow.Steps, Step{Name: "owner", Required: 1, Approvers: []map[string]any{{"type": "user", "id": "owner"}}})
+	task.Items = append(task.Items, Item{
+		Index: 1, Resource: map[string]any{"type": "channel", "id": "eng"}, Action: map[string]any{"name": "can_post"},
+		Status: StatusPending, Denial: map[string]any{"evaluation_id": "eval_2"},
+	})
+	return task
+}
+
+func testItemSteps(t *testing.T, s Store) {
+	ctx := context.Background()
+	if _, _, err := s.CreateTask(ctx, &NewTask{Task: bulkTask("arq_1")}, t0); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetTask(ctx, "arq_1")
+	if !got.Bulk || got.Callback == nil || got.Callback.State != "s1" || got.Items[1].Denial["evaluation_id"] != "eval_2" {
+		t.Fatalf("round trip lost phase 2 data: %+v", got)
+	}
+	// Item 0 moves to the owner step: the manager no longer sees the task
+	// for it, but item 1 is still at the manager step.
+	until := t0.Add(time.Hour)
+	if _, err := s.UpdateTask(ctx, "arq_1", func(*Task) (*Change, error) {
+		return &Change{ItemStep: map[int]int{0: 1}, NewDecisions: []Decision{{
+			ItemIndex: 0, ApproverIss: "iss", ApproverSub: "manager", Decision: DecisionApprove, DecidedAt: t0, ApprovedUntil: &until,
+		}}}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetTask(ctx, "arq_1")
+	if got.Items[0].CurrentStep != 1 || got.Items[1].CurrentStep != 0 || got.Decisions[0].ApprovedUntil == nil || !got.Decisions[0].ApprovedUntil.Equal(until) {
+		t.Fatalf("item step or decision lifetime not persisted: %+v", got)
+	}
+	for approver, want := range map[string]int{"manager": 1, "owner": 1, "nobody": 0} {
+		if page, _, err := s.ListPending(ctx, approver, "", 10); err != nil || len(page) != want {
+			t.Fatalf("%s lists %v (%v)", approver, ids(page), err)
+		}
+	}
+	// Once item 1 is denied, only the owner has work left.
+	if _, err := s.UpdateTask(ctx, "arq_1", func(*Task) (*Change, error) {
+		return &Change{ItemStatus: map[int]string{1: StatusDenied}}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if page, _, _ := s.ListPending(ctx, "manager", "", 10); len(page) != 0 {
+		t.Fatalf("manager still lists %v", ids(page))
+	}
+}
+
+func testBulkExpiry(t *testing.T, s Store) {
+	ctx := context.Background()
+	task := bulkTask("arq_1")
+	task.Items[1].Status = StatusApproved
+	if _, _, err := s.CreateTask(ctx, &NewTask{Task: task}, t0); err != nil {
+		t.Fatal(err)
+	}
+	expired, err := s.ExpireDue(ctx, t0.Add(2*time.Hour), 10)
+	if err != nil || len(expired) != 1 || expired[0].Status != StatusPartial {
+		t.Fatalf("a bulk task with an approved item expires as partial: %v %v", expired, err)
+	}
+	got, _ := s.GetTask(ctx, "arq_1")
+	if got.Status != StatusPartial || got.Items[0].Status != StatusExpired || got.Items[1].Status != StatusApproved {
+		t.Fatalf("expired bulk task: %+v", got)
+	}
+	// The callback asked for every event, so partial is enqueued.
+	d, err := s.ClaimCallbacks(ctx, t0.Add(2*time.Hour), time.Minute, 10)
+	if err != nil || len(d) != 1 || d[0].Event != StatusPartial {
+		t.Fatalf("callback for the expiry: %+v %v", d, err)
+	}
+}
+
+func testCallbacks(t *testing.T, s Store) {
+	ctx := context.Background()
+	quiet := bulkTask("arq_quiet")
+	quiet.Callback.Events = []string{StatusApproved}
+	tasks := []*Task{bulkTask("arq_1"), quiet}
+	for _, task := range tasks {
+		if _, _, err := s.CreateTask(ctx, &NewTask{Task: task}, t0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A pending task notifies nobody.
+	if d, _ := s.ClaimCallbacks(ctx, t0, time.Minute, 10); len(d) != 0 {
+		t.Fatalf("pending task enqueued %+v", d)
+	}
+	for _, task := range tasks {
+		done := t0
+		if _, err := s.UpdateTask(ctx, task.ID, func(*Task) (*Change, error) {
+			return &Change{Status: StatusDenied, CompletedAt: &done, ItemStatus: map[int]string{0: StatusDenied, 1: StatusDenied}}, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Only arq_1 asked for denied.
+	claimed, err := s.ClaimCallbacks(ctx, t0, time.Minute, 10)
+	if err != nil || len(claimed) != 1 || claimed[0].TaskID != "arq_1" || claimed[0].Event != StatusDenied || claimed[0].Attempts != 1 {
+		t.Fatalf("claim: %+v %v", claimed, err)
+	}
+	// Claimed: not claimable again until the lease lapses.
+	if d, _ := s.ClaimCallbacks(ctx, t0.Add(30*time.Second), time.Minute, 10); len(d) != 0 {
+		t.Fatalf("claimed twice within the lease: %+v", d)
+	}
+	if d, _ := s.ClaimCallbacks(ctx, t0.Add(2*time.Minute), time.Minute, 10); len(d) != 1 || d[0].Attempts != 2 {
+		t.Fatalf("lapsed lease not reclaimed: %+v", d)
+	}
+	id := claimed[0].ID
+	if err := s.RetryCallback(ctx, id, t0.Add(10*time.Minute), "503"); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := s.ClaimCallbacks(ctx, t0.Add(5*time.Minute), time.Minute, 10); len(d) != 0 {
+		t.Fatalf("claimed before the retry time: %+v", d)
+	}
+	if d, _ := s.ClaimCallbacks(ctx, t0.Add(10*time.Minute), time.Minute, 10); len(d) != 1 {
+		t.Fatalf("retry not claimable: %+v", d)
+	}
+	if err := s.MarkDelivered(ctx, id, t0.Add(10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := s.ClaimCallbacks(ctx, t0.Add(time.Hour), time.Minute, 10); len(d) != 0 {
+		t.Fatalf("delivered notification claimed again: %+v", d)
+	}
+}
+
+func testPurge(t *testing.T, s Store) {
+	ctx := context.Background()
+	done := t0
+	terminal := func(id string, approvals ...*Approval) {
+		task := newTask(id)
+		task.Status, task.Items[0].Status, task.CompletedAt = StatusApproved, StatusApproved, &done
+		idem := Idempotency{Requester: "r", Key: id, BodyHash: []byte("h"), RetainUntil: task.ExpiresAt}
+		if _, _, err := s.CreateTask(ctx, &NewTask{Task: task, Approvals: approvals, Idempotency: idem, JTIs: []JTI{{ID: id, Expires: t0}}}, t0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	short := newApproval("apr_short", "arq_short")
+	short.ApprovedUntil = t0.Add(2 * time.Hour)
+	long := newApproval("apr_long", "arq_long")
+	long.ApprovedUntil = t0.Add(48 * time.Hour)
+	terminal("arq_short", short)
+	terminal("arq_long", long)
+	if _, _, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_pending")}, t0); err != nil {
+		t.Fatal(err)
+	}
+	later := t0.Add(24 * time.Hour)
+	// Two expired keys and identifiers: the most of any one kind.
+	n, err := s.Purge(ctx, PurgeCutoffs{Tasks: later, Approvals: later, Now: later}, 10)
+	if err != nil || n != 2 {
+		t.Fatalf("purge: %d %v", n, err)
+	}
+	if _, err := s.GetTask(ctx, "arq_short"); !errors.Is(err, ErrNotFound) {
+		t.Fatal("an expired task whose approval lapsed survived")
+	}
+	if _, err := s.GetApproval(ctx, "apr_short"); !errors.Is(err, ErrNotFound) {
+		t.Fatal("its approval survived")
+	}
+	// A task whose approval is still in force, and a pending task, stay.
+	for _, id := range []string{"arq_long", "arq_pending"} {
+		if _, err := s.GetTask(ctx, id); err != nil {
+			t.Fatalf("%s purged: %v", id, err)
+		}
+	}
+	// Its idempotency key and token identifier are gone: the key may be
+	// reused and the token is no longer remembered.
+	reuse := newTask("arq_reuse")
+	if _, existed, err := s.CreateTask(ctx, &NewTask{
+		Task: reuse, Idempotency: Idempotency{Requester: "r", Key: "arq_short", BodyHash: []byte("other"), RetainUntil: later.Add(time.Hour)},
+		JTIs: []JTI{{ID: "arq_short", Expires: later.Add(time.Hour)}},
+	}, later); err != nil || existed {
+		t.Fatalf("purged key or identifier still held: %v %v", existed, err)
 	}
 }
 
@@ -276,8 +459,8 @@ func testExpire(t *testing.T, s Store) {
 		}
 	}
 	expired, err := s.ExpireDue(ctx, t0.Add(2*time.Minute), 10)
-	if err != nil || len(expired) != 1 || expired[0] != "arq_soon" {
-		t.Fatalf("expire: %v %v", expired, err)
+	if err != nil || len(expired) != 1 || expired[0].ID != "arq_soon" || expired[0].Status != StatusExpired {
+		t.Fatalf("expire: %v %v", ids(expired), err)
 	}
 	got, _ := s.GetTask(ctx, "arq_soon")
 	if got.Status != StatusExpired || got.Items[0].Status != StatusExpired || got.CompletedAt == nil {
@@ -327,8 +510,8 @@ func TestPostgresConcurrentMigrations(t *testing.T) {
 	if err := stores[0].pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&applied); err != nil {
 		t.Fatal(err)
 	}
-	if applied != 1 {
-		t.Fatalf("expected one recorded migration, got %d", applied)
+	if applied != 2 {
+		t.Fatalf("expected two recorded migrations, got %d", applied)
 	}
 }
 

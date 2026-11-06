@@ -74,12 +74,24 @@ func normalize(v any) any {
 	return out
 }
 
-// verifiedDenial is what a binding_token establishes about a submission.
+// verifiedDenial is what a binding_token establishes about one item.
 type verifiedDenial struct {
 	claims  map[string]any
+	echo    *denialEcho
 	jti     string
 	exp     time.Time
 	members []string
+}
+
+// record is the item's denial as stored: the verified claims that scope its
+// approval, and the echoed members shown to approvers.
+func (v *verifiedDenial) record() map[string]any {
+	evalID, _ := v.claims["evaluation_id"].(string)
+	return map[string]any{
+		"expires_at": v.echo.ExpiresAt, "evaluation_id": evalID, "evaluated_at": v.echo.EvaluatedAt,
+		"reason": v.echo.Reason, "template": v.echo.Template,
+		"binding_context_members": v.members, "context": v.claims["context"],
+	}
 }
 
 var (
@@ -87,9 +99,13 @@ var (
 	errInvalidBinding = errors.New("invalid denial binding")
 )
 
-// verifyBinding applies ARAP "Verifying the Denial Binding" to a submission
-// whose binding_token signature has already verified.
-func (s *Service) verifyBinding(claims map[string]any, sub *submission) (*verifiedDenial, error) {
+// verifyBinding applies ARAP "Verifying the Denial Binding" to one item of
+// a submission, whose binding_token signature has already verified. Each
+// item is bound by its own token: this PDP signs one per evaluation, so it
+// never issues the Bulk Profile's bundle denial, and a token covering a
+// different item fails here.
+func (s *Service) verifyBinding(claims map[string]any, sub *submission, it *subItem) (*verifiedDenial, error) {
+	echo := sub.denialFor(it)
 	invalid := func(format string, args ...any) (*verifiedDenial, error) {
 		return nil, fmt.Errorf("%w: "+format, append([]any{errInvalidBinding}, args...)...)
 	}
@@ -112,12 +128,12 @@ func (s *Service) verifyBinding(claims map[string]any, sub *submission) (*verifi
 	}
 
 	// The PEP-echoed expiry must match the protected one before it counts.
-	echoed, err := time.Parse(time.RFC3339, sub.denial.ExpiresAt)
+	echoed, err := time.Parse(time.RFC3339, echo.ExpiresAt)
 	if err != nil {
 		return invalid("denial.expires_at is not an RFC 3339 timestamp")
 	}
 	if protected, ok := claims["denial_expires_at"].(string); ok {
-		if protected != sub.denial.ExpiresAt {
+		if protected != echo.ExpiresAt {
 			return invalid("denial.expires_at does not match the binding_token")
 		}
 	} else if exp.After(echoed) {
@@ -131,8 +147,8 @@ func (s *Service) verifyBinding(claims map[string]any, sub *submission) (*verifi
 		return nil, errExpiredDenial
 	}
 
-	if sub.denial.EvaluationID != "" {
-		if id, _ := claims["evaluation_id"].(string); id != sub.denial.EvaluationID {
+	if echo.EvaluationID != "" {
+		if id, _ := claims["evaluation_id"].(string); id != echo.EvaluationID {
 			return invalid("denial.evaluation_id does not match the binding_token")
 		}
 	}
@@ -158,14 +174,14 @@ func (s *Service) verifyBinding(claims map[string]any, sub *submission) (*verifi
 	switch {
 	case !SameBinding(WithoutActor(claims["subject"]), WithoutActor(sub.Subject)):
 		return invalid("subject does not match the denied evaluation")
-	case !SameBinding(claims["resource"], sub.Resource):
+	case !SameBinding(claims["resource"], it.Resource):
 		return invalid("resource does not match the denied evaluation")
-	case !SameBinding(claims["action"], sub.Action):
+	case !SameBinding(claims["action"], it.Action):
 		return invalid("action does not match the denied evaluation")
 	case !SameBinding(boundCtx, RelevantContext(sub.Context, members)):
 		return invalid("authorization-relevant context does not match the denied evaluation")
 	}
-	return &verifiedDenial{claims: claims, jti: jti, exp: exp, members: members}, nil
+	return &verifiedDenial{claims: claims, echo: echo, jti: jti, exp: exp, members: members}, nil
 }
 
 func audienceIncludes(aud any, want string) bool {

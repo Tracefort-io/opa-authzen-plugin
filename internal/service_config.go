@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tracefort-io/opa-authzen-plugin/internal/ars"
 	"github.com/Tracefort-io/opa-authzen-plugin/internal/authn"
 )
 
@@ -38,6 +39,13 @@ type ServiceConfig struct {
 	// IdempotencyRetention keeps a terminal task and its Idempotency-Key
 	// for this long after expires_at, as a Go duration.
 	IdempotencyRetention string `json:"idempotency_retention,omitempty"`
+	// MaxItems bounds a bulk submission's items.
+	MaxItems int `json:"max_items,omitempty"`
+	// MaxSteps bounds a workflow's steps.
+	MaxSteps int `json:"max_steps,omitempty"`
+	// Callbacks enables the Callback Profile; without it a submitted
+	// `callback` is rejected.
+	Callbacks *CallbacksConfig `json:"callbacks,omitempty"`
 
 	dsn                  string
 	taskTTL              time.Duration
@@ -45,7 +53,31 @@ type ServiceConfig struct {
 	idempotencyRetention time.Duration
 	callers              *authn.Verifier
 	approvers            *authn.Verifier
+	callbacks            *ars.CallbackConfig
 }
+
+// CallbacksConfig lists the hosts callbacks may be sent to.
+type CallbacksConfig struct {
+	// Timeout bounds one delivery attempt, as a Go duration.
+	Timeout string `json:"timeout,omitempty"`
+	// MaxAttempts is how many attempts a notification gets.
+	MaxAttempts  int                   `json:"max_attempts,omitempty"`
+	Destinations []CallbackDestination `json:"destinations"`
+}
+
+// CallbackDestination is one allowed callback host. Its HMAC key is read
+// from the environment variable HMACSecretEnv, never from the config file.
+type CallbackDestination struct {
+	Host          string `json:"host"`
+	HMACSecretEnv string `json:"hmac_secret_env"`
+	// AllowInternal permits a host that resolves to loopback, private or
+	// other internal addresses, such as an in-cluster PEP.
+	AllowInternal bool `json:"allow_internal,omitempty"`
+}
+
+// minCallbackSecret is the shortest accepted HMAC key: the SHA-256 output
+// size, as RFC 2104 recommends.
+const minCallbackSecret = 32
 
 // DatabaseConfig locates the Postgres database. The DSN is read from the
 // environment variable named by DSNEnv, never from the config file.
@@ -142,6 +174,15 @@ func (s *ServiceConfig) load(cfg *Config, ac *AccessRequestConfig) error {
 		*d.dst = v
 	}
 
+	for name, v := range map[string]int{"max_items": s.MaxItems, "max_steps": s.MaxSteps} {
+		if v < 0 {
+			return fmt.Errorf("service %s must be positive", name)
+		}
+	}
+	if s.callbacks, err = s.Callbacks.load(); err != nil {
+		return fmt.Errorf("service callbacks: %w", err)
+	}
+
 	for name, tmpl := range map[string]string{"ticket": s.Links.Ticket, "review": s.Links.Review} {
 		if tmpl == "" {
 			continue
@@ -162,4 +203,53 @@ func (s *ServiceConfig) load(cfg *Config, ac *AccessRequestConfig) error {
 		return fmt.Errorf("access_request_endpoint %q differs from the hosted service's endpoint %q", cfg.AccessRequestEndpoint, own)
 	}
 	return nil
+}
+
+// load validates the callback destinations and reads their keys. A nil
+// config leaves callbacks disabled.
+func (c *CallbacksConfig) load() (*ars.CallbackConfig, error) {
+	if c == nil {
+		return nil, nil
+	}
+	out := &ars.CallbackConfig{
+		Timeout:      ars.DefaultCallbackTimeout,
+		MaxAttempts:  ars.DefaultCallbackMaxAttempts,
+		Destinations: map[string]ars.CallbackDestination{},
+	}
+	if t := strings.TrimSpace(c.Timeout); t != "" {
+		v, err := time.ParseDuration(t)
+		if err != nil || v <= 0 {
+			return nil, fmt.Errorf("timeout %q must be a positive duration", c.Timeout)
+		}
+		out.Timeout = v
+	}
+	switch {
+	case c.MaxAttempts < 0:
+		return nil, fmt.Errorf("max_attempts must be positive")
+	case c.MaxAttempts > 0:
+		out.MaxAttempts = c.MaxAttempts
+	}
+	if len(c.Destinations) == 0 {
+		return nil, fmt.Errorf("at least one destination is required")
+	}
+	for i, d := range c.Destinations {
+		host := strings.ToLower(strings.TrimSpace(d.Host))
+		// A bare host name or IP literal: the scheme is always https and
+		// any port on the host is allowed.
+		if host == "" || strings.ContainsAny(host, "/:@?#") {
+			return nil, fmt.Errorf("destinations[%d].host %q must be a bare host name or IPv4 address", i, d.Host)
+		}
+		if _, dup := out.Destinations[host]; dup {
+			return nil, fmt.Errorf("destinations[%d].host %q is listed twice", i, d.Host)
+		}
+		if d.HMACSecretEnv == "" {
+			return nil, fmt.Errorf("destinations[%d].hmac_secret_env is required", i)
+		}
+		secret := os.Getenv(d.HMACSecretEnv)
+		if len(secret) < minCallbackSecret {
+			return nil, fmt.Errorf("destinations[%d]: environment variable %s must hold at least %d bytes", i, d.HMACSecretEnv, minCallbackSecret)
+		}
+		out.Destinations[host] = ars.CallbackDestination{Secret: []byte(secret), AllowInternal: d.AllowInternal}
+	}
+	return out, nil
 }
