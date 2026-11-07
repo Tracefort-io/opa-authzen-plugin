@@ -245,6 +245,11 @@ type Store interface {
 	RetryCallback(ctx context.Context, id int64, next time.Time, lastErr string) error
 	// FailCallback gives a notification up.
 	FailCallback(ctx context.Context, id int64, now time.Time, lastErr string) error
+	// RememberJTI records a proof identifier, such as a DPoP proof's, until
+	// expires; false means it was recorded before. Shared by all replicas.
+	RememberJTI(ctx context.Context, id string, expires time.Time) (bool, error)
+	// Backlog counts pending tasks and undelivered callback notifications.
+	Backlog(ctx context.Context) (pendingTasks, undeliveredCallbacks int64, err error)
 	// Purge deletes up to limit expired rows of each kind (PurgeCutoffs) and
 	// returns the most rows it deleted of any one kind, so a caller repeats
 	// while that reaches limit.

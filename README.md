@@ -384,7 +384,11 @@ When a PEP re-evaluates after approval it carries the Approval Result at `contex
       approval_issuers:
         - issuer: "https://requests.example.com"
           jwks_file: /etc/authzen/ars-jwks.json   # public keys, each with kid and alg
+        - issuer: "https://pdp-a.example.com"     # another plugin hosting the service
+          jwks_uri: "https://pdp-a.example.com/access/v1/jwks"   # fetched and refreshed
 ```
+
+Each issuer gives exactly one of `jwks_file` and `jwks_uri`. A `jwks_uri` set is fetched lazily, cached for ten minutes, and refetched when a state names an unknown `kid` (at most every 30 seconds), so the issuer can rotate keys without files being redistributed.
 
 The `approval.state` must be a compact JWS signed by a configured issuer's key and carry `iss`, an `aud` naming `base_url`, `approval_id` equal to `approval.id`, `approved_until` (RFC 3339, not past, with 30 seconds of clock skew), and the approved `subject`, `resource`, `action` and, for the members listed in `binding_context_members`, `context` — compared with the current request under the profile's exact-match approval scope (`subject.properties.act` excluded). The policy then sees one of:
 
@@ -461,7 +465,7 @@ The service requires `base_url` and a `binding_token` signing key: submissions a
 | `POST /access/v1/admin/tasks/{id}/decisions` | Approver API: `{"decision": "approve" \| "deny", "items": [0, 2], "comment", "approved_until"}`. `items` defaults to every item the approver can decide now; the decision is all or nothing. `approved_until` may only shorten the planned lifetime. |
 | `POST /access/v1/admin/approvals/{id}/revoke` | Approver API: revoke an approval; the next re-evaluation presenting it is denied. |
 
-The `/access/v1/admin` API is an extension of this plugin, not part of the profile, which leaves out how approvers find and act on requests. Errors use the profile's `application/problem+json` types. Callers and approvers authenticate with bearer JWTs from the configured issuers and are identified by (`iss`, `sub`); sender-constrained tokens (with a `cnf` claim) are rejected.
+The `/access/v1/admin` API is an extension of this plugin, not part of the profile, which leaves out how approvers find and act on requests. Errors use the profile's `application/problem+json` types. Callers and approvers authenticate with JWTs from the configured issuers and are identified by (`iss`, `sub`); tokens bound to a key are accepted with `sender_constraint` (see [Sender-constrained tokens](#sender-constrained-tokens)) and refused otherwise.
 
 **Rules.** Each rule receives `input.operation` and returns:
 
@@ -514,9 +518,80 @@ ars_approver if {
 
 **Audit.** Each committed change — `submitted`, `decided`, `step_completed`, `approved`, `denied`, `partial`, `cancelled`, `expired`, `revoked`, `callback_delivered`, `callback_failed` — is an OpenTelemetry log record named `authzen.access_request.<event>`, with `authzen.*` attributes for the task, approval, evaluation, actor, subject, resource and action (or `items` for a bulk task). Records are exported over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set; retention is the OpenTelemetry pipeline's. Without an endpoint the service logs a warning and records are not exported.
 
-**Not yet supported.** DPoP or mTLS-bound tokens, the Catalog profile, and OpenTelemetry metrics.
+**Approval cache.** `approval_cache_ttl` (default off) caches, per replica, approvals found in force at re-evaluation, so repeated re-evaluations skip the database. Scope is still checked every time, and revoked or lapsed approvals are never cached. A revocation through a replica clears its own entry at once; other replicas may accept the revoked approval for up to the TTL.
+
+**Other PDPs verifying approvals.** A PDP without access to the database can verify this service's approvals by signature:
+
+```yaml
+# On the PDP hosting the service (https://pdp-a.example.com):
+      service:
+        approval_state_ttl: 15m                          # optional: cap each signed state's lifetime
+        approval_state_audiences: ["https://pdp-b.example.com"]   # the peers, named in the state's aud
+# On the peer (base_url https://pdp-b.example.com):
+    access_request:
+      approval_issuers:
+        - issuer: "https://pdp-a.example.com"
+          jwks_uri: "https://pdp-a.example.com/access/v1/jwks"
+```
+
+The profile requires `approval.state` to name the verifying PDP in `aud`, so list every peer in `approval_state_audiences`. A peer cannot see revocation: it honours a state until its `exp`. Unset, that is `approved_until`; with `approval_state_ttl`, it is at most the TTL after signing. Each read of the task status signs a fresh state, so a PEP refreshes it by reading the task again.
+
+**Metrics.** With `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` set, the plugin exports OpenTelemetry metrics over OTLP/HTTP:
+- counters `authzen.ars.submissions` (`outcome`, `problem`), `authzen.ars.decisions`, `authzen.ars.transitions` (`status`), `authzen.ars.approval_lookups` (`result`, `cached`), `authzen.ars.db_errors` (`operation`), `authzen.ars.auth_failures` (`api`, `reason`) and `authzen.ars.callback_deliveries` (`outcome`);
+- histograms `authzen.ars.sweep_lag` and `authzen.ars.callback_latency`, in seconds;
+- gauges `authzen.ars.pending_tasks` and `authzen.ars.callback_backlog`, read from the database. Every replica reports the same total, so aggregate them with max, not sum.
+
+An idempotent retry, a submission repeating an `Idempotency-Key` that returns the original task, counts as another submission in `authzen.ars.submissions`; it creates no task and no audit record.
+
+**Not yet supported.** The Catalog profile.
 
 **With OPA's own authorization.** If OPA runs with `--authentication=token --authorization=basic`, its `system.authz` policy sees every request, including those to `/access/v1/requests` and `/access/v1/admin`, whose bearer tokens are IdP JWTs rather than OPA tokens. Allow those paths in `system.authz`; the service authenticates them itself.
+
+### PEP authentication
+
+The Authorization API says the PDP SHOULD authenticate the calling PEP. With `pep_auth`, the evaluation, evaluations and search endpoints require an access token from a listed issuer; anything else is `401` with a `WWW-Authenticate` challenge. The metadata document and `/access/v1/jwks` stay open for discovery.
+
+```yaml
+plugins:
+  authzen:
+    base_url: "https://pdp.example.com"
+    pep_auth:
+      issuers:
+        - issuer: "https://idp.example.com"
+          audience: "https://pdp.example.com"
+          jwks_uri: "https://idp.example.com/.well-known/jwks.json"
+      sender_constraint: {dpop: {enabled: true}}   # optional, see below
+```
+
+Policies see the authenticated PEP as `input.pep` (`iss`, `sub`, `client_id`, `claims`), for example `allow if input.pep.client_id == "procurement-app"`. Without `pep_auth` there is no `input.pep` and nothing changes. This authenticates the PEP, not the subject the PEP reports. Search page tokens are bound to the PEP that requested them.
+
+If OPA's own `--authentication`/`--authorization` also runs, its `system.authz` sees these requests first.
+
+### Sender-constrained tokens
+
+`caller_auth`, `approver_auth` and `pep_auth` each accept `sender_constraint`, so that a stolen token alone is useless:
+
+```yaml
+sender_constraint:
+  require: false            # true: unbound bearer tokens are refused
+  dpop: {enabled: true, max_age: 60s}
+  mtls: {enabled: true, source: header, header: X-Forwarded-Client-Cert, format: envoy_xfcc}
+```
+
+A token carrying `cnf` is accepted only through the mechanism it names. A bound token sent as `Bearer`, or an unbound one sent as `DPoP`, is refused.
+
+- **DPoP (RFC 9449).** The request carries `Authorization: DPoP <token>` and a `DPoP` proof. The proof is checked as follows:
+  - `typ` is `dpop+jwt`, and `alg` is one of ES256, ES384, RS256, PS256 or EdDSA;
+  - it is signed by the public `jwk` in its header, whose RFC 7638 thumbprint equals the token's `cnf.jkt`;
+  - `htm` is the method, `htu` is `base_url` plus the path, and `ath` is the token's SHA-256;
+  - `iat` is within `max_age`, with 30 seconds of skew, and `jti` has not been used.
+
+  On the service APIs, used `jti` values are recorded in the database, shared by every replica. On the AuthZEN API they are recorded per replica, keeping the database off the evaluation path, so a replay to another replica within `max_age` is not detected there. Server nonces are not used. DPoP needs `base_url`.
+- **mTLS-bound tokens (RFC 8705).** The token's `cnf.x5t#S256` must equal the SHA-256 of the client certificate, taken from:
+  - `source: tls`: OPA's own TLS connection. OPA asks for client certificates only with `--authentication=tls`, which then requires one on every endpoint.
+  - `source: header`: a proxy that terminated mTLS. With `format: envoy_xfcc`, the `Hash` (or `Cert`) of the last element of Envoy's `X-Forwarded-Client-Cert` is used; with `format: pem`, a URL-encoded PEM certificate. The proxy must strip any copy of that header the client sends; the plugin cannot tell.
+
+Failures are `401` with `WWW-Authenticate: Bearer …` and/or `DPoP … algs="…"`, carrying `error="invalid_token"` or `error="invalid_dpop_proof"`.
 
 ### Decision logs
 

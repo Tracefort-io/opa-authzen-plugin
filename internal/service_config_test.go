@@ -81,6 +81,30 @@ func TestServiceConfigOverrides(t *testing.T) {
 
 const callbackSecretEnv = "TEST_CALLBACK_SECRET"
 
+// senderConstraint sets the caller API's sender_constraint.
+func senderConstraint(c map[string]any, sc map[string]any) {
+	service(c)["caller_auth"].(map[string]any)["sender_constraint"] = sc
+}
+
+func TestPEPAuthConfig(t *testing.T) {
+	ok := `{"base_url": "https://pdp.example.com", "pep_auth": {"issuers": [{"issuer": "https://idp.example.com",
+		"audience": "https://pdp.example.com", "jwks_uri": "https://idp.example.com/jwks"}],
+		"sender_constraint": {"dpop": {"enabled": true}, "mtls": {"enabled": true, "source": "header", "header": "X-Forwarded-Client-Cert", "format": "envoy_xfcc"}}}}`
+	cfg, err := Validate(nil, []byte(ok))
+	if err != nil || cfg.PEPAuth.verifier == nil {
+		t.Fatalf("pep_auth: %v", err)
+	}
+	for name, conf := range map[string]string{
+		"no issuers": `{"pep_auth": {"issuers": []}}`,
+		"dpop without base_url": `{"pep_auth": {"issuers": [{"issuer": "https://idp.example.com", "audience": "a",
+			"jwks_uri": "https://idp.example.com/jwks"}], "sender_constraint": {"dpop": {"enabled": true}}}}`,
+	} {
+		if _, err := Validate(nil, []byte(conf)); err == nil || !strings.Contains(err.Error(), "pep_auth") {
+			t.Errorf("%s: expected a pep_auth error, got %v", name, err)
+		}
+	}
+}
+
 func callbacksConf(destinations ...any) map[string]any {
 	return map[string]any{"destinations": destinations}
 }
@@ -151,6 +175,22 @@ func TestServiceConfigRejects(t *testing.T) {
 		},
 		"callback secret short": func(c map[string]any) {
 			service(c)["callbacks"] = callbacksConf(map[string]any{"host": "pep.example.com", "hmac_secret_env": "SHORT_SECRET"})
+		},
+		"negative state ttl":    func(c map[string]any) { service(c)["approval_state_ttl"] = "-1m" },
+		"bad cache ttl":         func(c map[string]any) { service(c)["approval_cache_ttl"] = "often" },
+		"bad state audience":    func(c map[string]any) { service(c)["approval_state_audiences"] = []any{"peer-pdp"} },
+		"require without proof": func(c map[string]any) { senderConstraint(c, map[string]any{"require": true}) },
+		"mtls without source":   func(c map[string]any) { senderConstraint(c, map[string]any{"mtls": map[string]any{"enabled": true}}) },
+		"dpop bad max age": func(c map[string]any) {
+			senderConstraint(c, map[string]any{"dpop": map[string]any{"enabled": true, "max_age": "long"}})
+		},
+		"approval issuer file and uri": func(c map[string]any) {
+			c["access_request"].(map[string]any)["approval_issuers"] = []any{map[string]any{
+				"issuer": "https://ars.example.com", "jwks_file": "/x.json", "jwks_uri": "https://ars.example.com/jwks",
+			}}
+		},
+		"approval issuer without keys": func(c map[string]any) {
+			c["access_request"].(map[string]any)["approval_issuers"] = []any{map[string]any{"issuer": "https://ars.example.com"}}
 		},
 		"callback bad timeout": func(c map[string]any) {
 			cb := callbacksConf(map[string]any{"host": "pep.example.com", "hmac_secret_env": callbackSecretEnv})

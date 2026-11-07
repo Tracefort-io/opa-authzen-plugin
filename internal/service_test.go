@@ -65,7 +65,7 @@ type serviceFixture struct {
 	store  store.Store
 }
 
-func newServiceFixture(t *testing.T, st store.Store) *serviceFixture {
+func newServiceFixture(t *testing.T, st store.Store, edits ...func(c map[string]any, idpJWKS string)) *serviceFixture {
 	t.Helper()
 	f := &serviceFixture{store: st}
 	_, _, f.idpKey = testKey(t, t.TempDir(), "idp-1")
@@ -82,6 +82,9 @@ func newServiceFixture(t *testing.T, st store.Store) *serviceFixture {
 		s := service(c)
 		s["caller_auth"] = map[string]any{"issuers": []any{map[string]any{"issuer": "https://idp.example.com", "audience": pdpID, "jwks_uri": idp.URL}}}
 		s["approver_auth"] = map[string]any{"issuers": []any{map[string]any{"issuer": "https://idp.example.com", "audience": "approver-api", "jwks_uri": idp.URL}}}
+		for _, edit := range edits {
+			edit(c, idp.URL)
+		}
 	})
 	cfg, err := Validate(nil, conf)
 	if err != nil {

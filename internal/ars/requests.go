@@ -312,9 +312,11 @@ func itemDetail(sub *submission, i int, detail string) string {
 // Submission").
 func (s *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	caller, err := s.d.Callers.Authenticate(r)
-	if err != nil {
-		unauthenticated(w)
+	rec := &outcomeRecorder{ResponseWriter: w}
+	w = rec
+	defer s.countSubmission(ctx, rec)
+	caller, ok := s.authenticate(w, r, s.d.Callers, "caller")
+	if !ok {
 		return
 	}
 	sub, status, typ, detail := s.parseSubmission(r)
@@ -324,6 +326,7 @@ func (s *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	// Actor Profile: a claimed chain the caller's credential does not
 	// authorize is rejected.
+	var err error
 	if sub.actor, err = verifyActor(caller, sub); err != nil {
 		writeProblem(w, http.StatusForbidden, problemGeneric, "Actor chain not verified", err.Error())
 		return
@@ -339,7 +342,7 @@ func (s *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	in := map[string]any{"operation": "submit", "caller": callerInput(caller), "submission": ruleSubmission(sub)}
-	ok, err := s.allowed(ctx, s.d.Rules.Caller, in)
+	ok, err = s.allowed(ctx, s.d.Rules.Caller, in)
 	if err != nil {
 		s.d.Logger.Error("AuthZEN access request: caller rule: %v", err)
 		internalError(w)
@@ -403,6 +406,7 @@ func (s *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		s.d.Audit.Emit(ctx, "submitted", s.auditTask(stored, caller))
 		if store.IsTerminal(stored.Status) {
 			s.d.Audit.Emit(ctx, stored.Status, s.auditTask(stored, caller))
+			s.completed(ctx, stored)
 		}
 	}
 	s.writeTask(ctx, w, stored, true)
@@ -533,9 +537,8 @@ func (s *Service) writeTask(ctx context.Context, w http.ResponseWriter, t *store
 // loadAuthorized authenticates the caller, loads the task and checks the
 // caller rule for op. A task the caller may not see is reported as unknown.
 func (s *Service) loadAuthorized(w http.ResponseWriter, r *http.Request, op string) (*store.Task, *authn.Identity, bool) {
-	caller, err := s.d.Callers.Authenticate(r)
-	if err != nil {
-		unauthenticated(w)
+	caller, ok := s.authenticate(w, r, s.d.Callers, "caller")
+	if !ok {
 		return nil, nil, false
 	}
 	t, err := s.d.Store.GetTask(r.Context(), r.PathValue("id"))
@@ -548,7 +551,7 @@ func (s *Service) loadAuthorized(w http.ResponseWriter, r *http.Request, op stri
 		internalError(w)
 		return nil, nil, false
 	}
-	ok, err := s.allowed(r.Context(), s.d.Rules.Caller, map[string]any{"operation": op, "caller": callerInput(caller), "task": ruleTask(t)})
+	ok, err = s.allowed(r.Context(), s.d.Rules.Caller, map[string]any{"operation": op, "caller": callerInput(caller), "task": ruleTask(t)})
 	if err != nil {
 		s.d.Logger.Error("AuthZEN access request: caller rule: %v", err)
 		internalError(w)
@@ -619,6 +622,7 @@ func (s *Service) handleCancel(w http.ResponseWriter, r *http.Request) {
 	attrs := s.auditTask(updated, caller)
 	attrs["reason"], attrs["comment"] = body.Reason, body.Comment
 	s.d.Audit.Emit(r.Context(), "cancelled", attrs)
+	s.completed(r.Context(), updated)
 	s.writeTask(r.Context(), w, updated, false)
 }
 

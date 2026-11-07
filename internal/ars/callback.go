@@ -254,9 +254,14 @@ func (s *Service) deliver(ctx context.Context, d store.Delivery) {
 	attrs := s.auditTask(t, nil)
 	attrs["event"], attrs["endpoint"], attrs["attempts"] = d.Event, t.Callback.Endpoint, strconv.Itoa(d.Attempts)
 	s.d.Audit.Emit(ctx, "callback_delivered", attrs)
+	s.d.Metrics.Count(ctx, MetricCallbackDeliveries, map[string]string{"outcome": "delivered"})
+	if t.CompletedAt != nil {
+		s.d.Metrics.Observe(ctx, MetricCallbackLatency, seconds(s.now().Sub(*t.CompletedAt)), nil)
+	}
 }
 
 func (s *Service) retryCallback(ctx context.Context, d store.Delivery, t *store.Task, reason string) {
+	s.d.Metrics.Count(ctx, MetricCallbackDeliveries, map[string]string{"outcome": "retry"})
 	next := s.now().Add(callbackBackoff(d.Attempts))
 	if err := s.d.Store.RetryCallback(ctx, d.ID, next, reason); err != nil {
 		s.d.Logger.Error("AuthZEN access request service: scheduling callback retry: %v", err)
@@ -278,6 +283,7 @@ func (s *Service) failCallback(ctx context.Context, d store.Delivery, t *store.T
 	}
 	attrs["event"], attrs["attempts"], attrs["error"] = d.Event, strconv.Itoa(d.Attempts), reason
 	s.d.Audit.Emit(ctx, "callback_failed", attrs)
+	s.d.Metrics.Count(ctx, MetricCallbackDeliveries, map[string]string{"outcome": "failed"})
 }
 
 // callbackBackoff doubles from the base per attempt, up to the maximum,

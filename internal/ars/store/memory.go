@@ -352,6 +352,35 @@ func (m *Memory) FailCallback(_ context.Context, id int64, _ time.Time, lastErr 
 	return err
 }
 
+// RememberJTI implements Store.
+func (m *Memory) RememberJTI(_ context.Context, id string, expires time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, seen := m.jtis[id]; seen {
+		return false, nil
+	}
+	m.jtis[id] = expires
+	return true, nil
+}
+
+// Backlog implements Store.
+func (m *Memory) Backlog(context.Context) (int64, int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var pending, undelivered int64
+	for _, t := range m.tasks {
+		if t.Status == StatusPending {
+			pending++
+		}
+	}
+	for _, d := range m.outbox {
+		if !d.delivered && !d.failed {
+			undelivered++
+		}
+	}
+	return pending, undelivered, nil
+}
+
 // Purge implements Store.
 func (m *Memory) Purge(_ context.Context, c PurgeCutoffs, limit int) (int, error) {
 	m.mu.Lock()

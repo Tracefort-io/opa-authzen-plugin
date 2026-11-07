@@ -9,11 +9,13 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Tracefort-io/opa-authzen-plugin/internal/ars"
 	"github.com/Tracefort-io/opa-authzen-plugin/internal/ars/store"
+	"github.com/Tracefort-io/opa-authzen-plugin/internal/authn"
 	"github.com/google/uuid"
 	"github.com/lestrrat-go/jwx/v3/jwa"
 	"github.com/lestrrat-go/jwx/v3/jwk"
@@ -105,18 +107,40 @@ type AccessRequestConfig struct {
 	signingAlg jwa.SignatureAlgorithm
 	signingKID string
 	denialTTL  time.Duration
-	issuers    map[string]jwk.Set
+	issuers    map[string]approvalKeys
 	publicKeys jwk.Set
+	// remoteKeys are the approval issuers' sets fetched from jwks_uri,
+	// served in the PDP's JWK Set as they currently stand.
+	remoteKeys []*authn.RemoteKeys
 }
 
-// ApprovalIssuer is one trusted signer of `approval.state`.
+// ApprovalIssuer is one trusted signer of `approval.state`, with its keys
+// in a file or at a URL.
 type ApprovalIssuer struct {
 	// Issuer is the exact `iss` claim the signer uses.
 	Issuer string `json:"issuer"`
 	// JWKSFile is a JWK Set of the signer's public keys. Each key must carry
 	// `kid` and `alg`.
-	JWKSFile string `json:"jwks_file"`
+	JWKSFile string `json:"jwks_file,omitempty"`
+	// JWKSURI is where the signer publishes its JWK Set, such as another
+	// plugin's /access/v1/jwks. It is fetched and refreshed like token
+	// issuers' keys, so the signer can rotate keys without redistributing
+	// files.
+	JWKSURI string `json:"jwks_uri,omitempty"`
 }
+
+// approvalKeys yields a trusted signer's keys for a kid.
+type approvalKeys interface {
+	keys(ctx context.Context, kid string) (jwk.Set, error)
+}
+
+type fileKeys struct{ set jwk.Set }
+
+func (f fileKeys) keys(context.Context, string) (jwk.Set, error) { return f.set, nil }
+
+type urlKeys struct{ r *authn.RemoteKeys }
+
+func (u urlKeys) keys(ctx context.Context, kid string) (jwk.Set, error) { return u.r.Keys(ctx, kid) }
 
 // load validates the configuration and reads its key material. It runs from
 // Validate, after base_url and jwks_uri are normalized; when the plugin ends
@@ -191,7 +215,7 @@ func (a *AccessRequestConfig) load(cfg *Config) error {
 		if cfg.BaseURL == "" {
 			return fmt.Errorf("approval_issuers requires base_url, the audience an approval.state must name")
 		}
-		a.issuers = map[string]jwk.Set{}
+		a.issuers = map[string]approvalKeys{}
 		for i, iss := range a.ApprovalIssuers {
 			name := strings.TrimSpace(iss.Issuer)
 			if name == "" {
@@ -199,6 +223,19 @@ func (a *AccessRequestConfig) load(cfg *Config) error {
 			}
 			if _, dup := a.issuers[name]; dup {
 				return fmt.Errorf("approval_issuers[%d].issuer %q is listed twice", i, name)
+			}
+			if (iss.JWKSFile == "") == (iss.JWKSURI == "") {
+				return fmt.Errorf("approval_issuers[%d] (%s) needs exactly one of jwks_file and jwks_uri", i, name)
+			}
+			if iss.JWKSURI != "" {
+				remote, err := authn.NewRemoteKeys(iss.JWKSURI, nil)
+				if err != nil {
+					return fmt.Errorf("approval_issuers[%d] (%s): %w", i, name, err)
+				}
+				a.ApprovalIssuers[i].Issuer = name
+				a.issuers[name] = urlKeys{r: remote}
+				a.remoteKeys = append(a.remoteKeys, remote)
+				continue
 			}
 			set, err := loadIssuerKeys(iss.JWKSFile)
 			if err != nil {
@@ -212,11 +249,11 @@ func (a *AccessRequestConfig) load(cfg *Config) error {
 				}
 			}
 			a.ApprovalIssuers[i].Issuer = name
-			a.issuers[name] = set
+			a.issuers[name] = fileKeys{set: set}
 		}
 	}
 
-	if served.Len() > 0 {
+	if served.Len() > 0 || len(a.remoteKeys) > 0 {
 		a.publicKeys = served
 		if cfg.JWKSURI == "" {
 			cfg.JWKSURI = cfg.BaseURL + jwksPath
@@ -307,6 +344,7 @@ func (p *AuthZenPlugin) handleJWKS(w http.ResponseWriter, r *http.Request) {
 	p.mu.RLock()
 	stopped := p.stopped
 	set := p.cfg.AccessRequest.publicKeys
+	remotes := p.cfg.AccessRequest.remoteKeys
 	p.mu.RUnlock()
 	if stopped {
 		jsonError(w, "plugin is shutting down", http.StatusServiceUnavailable)
@@ -315,6 +353,29 @@ func (p *AuthZenPlugin) handleJWKS(w http.ResponseWriter, r *http.Request) {
 	if set == nil {
 		jsonError(w, "no keys are configured", http.StatusNotFound)
 		return
+	}
+	if len(remotes) > 0 {
+		// Approval issuers trusted by URL: their keys as currently
+		// published. One that cannot be fetched is left out and logged.
+		merged, err := set.Clone()
+		if err != nil {
+			jsonError(w, "failed to build key set", http.StatusInternalServerError)
+			return
+		}
+		for _, remote := range remotes {
+			rs, err := remote.Keys(r.Context(), "")
+			if err != nil {
+				p.logger.Warn("AuthZEN jwks: fetching a trusted approval issuer's keys: %v", err)
+				continue
+			}
+			for i := range rs.Len() {
+				k, _ := rs.Key(i)
+				if pub, err := k.PublicKey(); err == nil {
+					_ = merged.AddKey(pub)
+				}
+			}
+		}
+		set = merged
 	}
 	body, err := json.Marshal(set)
 	if err != nil {
@@ -571,18 +632,28 @@ func (p *AuthZenPlugin) verifyApproval(ctx context.Context, input map[string]any
 	now := p.now().UTC()
 	var verified map[string]any
 	var aerr *approvalError
+	cached := false
 	if snap.approvals != nil {
-		found, v, e, err := lookupApproval(ctx, snap.approvals, raw, input, snap, now)
+		found, v, e, hit, err := lookupApproval(ctx, snap.approvals, raw, input, snap, now)
 		if err != nil {
+			p.metrics.Count(ctx, ars.MetricApprovalLookups, map[string]string{"result": "error", "cached": "false"})
+			p.metrics.Count(ctx, ars.MetricDBErrors, map[string]string{"operation": "approval_lookup"})
 			return err
 		}
 		if found {
-			verified, aerr = v, e
+			verified, aerr, cached = v, e, hit
 		}
 	}
+	defer func() {
+		result := "verified"
+		if aerr != nil {
+			result = aerr.reason
+		}
+		p.metrics.Count(ctx, ars.MetricApprovalLookups, map[string]string{"result": result, "cached": strconv.FormatBool(cached)})
+	}()
 	if verified == nil {
 		if len(snap.accessRequest.issuers) > 0 {
-			verified, aerr = checkApproval(raw, input, snap, now)
+			verified, aerr = checkApproval(ctx, raw, input, snap, now)
 		} else {
 			verified, aerr = unverifiable(raw, errors.New("approval is not held by the Access Request Service"))
 		}
@@ -612,27 +683,33 @@ func unverifiable(raw any, err error) (map[string]any, *approvalError) {
 
 // lookupApproval resolves an approval in the Access Request Service store
 // ("Approval Reference by Lookup", "Current Approval Status", "Approval
-// Scope"). found is false when the store holds no such approval.
-func lookupApproval(ctx context.Context, st store.Store, raw any, input map[string]any, snap *evalConfig, now time.Time) (bool, map[string]any, *approvalError, error) {
+// Scope"), or in the approval cache when one is configured (cached
+// reports which). found is false when the store holds no such approval.
+func lookupApproval(ctx context.Context, st store.Store, raw any, input map[string]any, snap *evalConfig, now time.Time) (found bool, verified map[string]any, aerr *approvalError, cached bool, err error) {
 	approval, ok := raw.(map[string]any)
 	if !ok {
 		v, e := unverifiable(raw, errors.New("approval is not an object"))
-		return true, v, e, nil
+		return true, v, e, false, nil
 	}
 	id, _ := approval["id"].(string)
 	if id == "" {
 		v, e := unverifiable(raw, errors.New("approval.id is missing"))
-		return true, v, e, nil
+		return true, v, e, false, nil
 	}
-	a, err := st.GetApproval(ctx, id)
-	if errors.Is(err, store.ErrNotFound) {
-		return false, nil, nil, nil
+	a := snap.approvalCache.get(id, now)
+	cached = a != nil
+	if a == nil {
+		a, err = st.GetApproval(ctx, id)
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil, nil, false, nil
+		}
+		if err != nil {
+			return false, nil, nil, false, fmt.Errorf("looking up approval %s: %w", id, err)
+		}
+		snap.approvalCache.put(a, now)
 	}
-	if err != nil {
-		return false, nil, nil, fmt.Errorf("looking up approval %s: %w", id, err)
-	}
-	fail := func(reason string, err error) (bool, map[string]any, *approvalError, error) {
-		return true, map[string]any{"id": id, "verified": false, "reason": reason}, &approvalError{reason: reason, err: err}, nil
+	fail := func(reason string, err error) (bool, map[string]any, *approvalError, bool, error) {
+		return true, map[string]any{"id": id, "verified": false, "reason": reason}, &approvalError{reason: reason, err: err}, cached, nil
 	}
 	if a.RevokedAt != nil {
 		return fail(reasonApprovalExpired, errors.New("approval was revoked"))
@@ -657,7 +734,7 @@ func lookupApproval(ctx context.Context, st store.Store, raw any, input map[stri
 		"task_id":        a.TaskID,
 		"approved_at":    a.ApprovedAt.UTC().Format(time.RFC3339),
 		"approved_until": a.ApprovedUntil.UTC().Format(time.RFC3339),
-	}, nil, nil
+	}, nil, cached, nil
 }
 
 func nonNil(m map[string]any) map[string]any {
@@ -674,7 +751,7 @@ type approvalError struct {
 	err    error
 }
 
-func checkApproval(raw any, input map[string]any, snap *evalConfig, now time.Time) (map[string]any, *approvalError) {
+func checkApproval(ctx context.Context, raw any, input map[string]any, snap *evalConfig, now time.Time) (map[string]any, *approvalError) {
 	out := map[string]any{"verified": false}
 	fail := func(reason string, err error) (map[string]any, *approvalError) {
 		out["reason"] = reason
@@ -702,9 +779,17 @@ func checkApproval(raw any, input map[string]any, snap *evalConfig, now time.Tim
 	if err := decodeJWTSegment(parts[1], &unverified); err != nil {
 		return fail(reasonApprovalUnverifiable, fmt.Errorf("approval.state claims: %w", err))
 	}
-	keys, ok := snap.accessRequest.issuers[unverified.Iss]
+	var header struct {
+		Kid string `json:"kid"`
+	}
+	_ = decodeJWTSegment(parts[0], &header)
+	source, ok := snap.accessRequest.issuers[unverified.Iss]
 	if !ok {
 		return fail(reasonApprovalUnverifiable, fmt.Errorf("approval.state issuer %q is not trusted", unverified.Iss))
+	}
+	keys, err := source.keys(ctx, header.Kid)
+	if err != nil {
+		return fail(reasonApprovalUnverifiable, fmt.Errorf("approval.state issuer %q keys: %w", unverified.Iss, err))
 	}
 	payload, err := jws.Verify([]byte(state), jws.WithKeySet(keys))
 	if err != nil {

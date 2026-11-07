@@ -19,6 +19,15 @@ Changes in the Tracefort fork. Nothing changes for a deployment that sets none o
   - Actor Delegation profile verification of `client.actor` and `subject.properties.act` against the caller token's `act` chain;
   - a purge worker for expired rows.
   - New options: `max_items`, `max_steps` and `callbacks`. Schema migration `0002` runs at startup.
+- Phase 3 (design §19):
+  - **Sender-constrained tokens:** `sender_constraint` on `caller_auth`, `approver_auth` and `pep_auth`. It covers DPoP (RFC 9449), with `iat` freshness and `jti` replay protection, recorded in the database on the service APIs. It also covers mTLS-bound tokens (RFC 8705), with the certificate taken from OPA's TLS or from a proxy header (Envoy `X-Forwarded-Client-Cert`, or URL-encoded PEM). Failures answer `401` with `Bearer`/`DPoP` challenges.
+  - **PEP authentication:** `pep_auth` on the evaluation, evaluations and search endpoints, the spec's "the PDP SHOULD authenticate the calling PEP". Policies see the PEP as `input.pep`.
+  - **Approval cache:** `approval_cache_ttl`, per replica, off by default.
+  - **Peer PDPs:**
+    - `approval_issuers[].jwks_uri`, fetched and refreshed like token issuers' keys;
+    - `approval_state_ttl`, which caps a signed `approval.state`'s `exp`;
+    - `approval_state_audiences`, which names peer PDPs in the state's `aud`.
+  - **OpenTelemetry metrics** over OTLP/HTTP.
 - Changed from phase 1:
   - a submitted `callback` is rejected with 400 unless `callbacks` allows its endpoint (it was ignored);
   - a claimed actor chain the caller's token does not carry is rejected with 403 (it was withheld from the rules);

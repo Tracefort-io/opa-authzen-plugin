@@ -91,9 +91,18 @@ type Deps struct {
 	MaxSteps int
 	// Callbacks enables the Callback Profile; nil rejects `callback`.
 	Callbacks *CallbackConfig
-	Logger    logging.Logger
-	Audit     Auditor
-	Now       func() time.Time
+	// ApprovalStateTTL, when positive, caps each signed approval.state at
+	// signing time plus this; zero keeps it valid until approved_until.
+	ApprovalStateTTL time.Duration
+	// ApprovalStateAudiences are other PDPs that verify approval.state by
+	// signature, named in its `aud` beside BaseURL.
+	ApprovalStateAudiences []string
+	// OnRevoke is told of each revoked approval, so caches can drop it.
+	OnRevoke func(approvalID string)
+	Logger   logging.Logger
+	Audit    Auditor
+	Metrics  Metrics
+	Now      func() time.Time
 }
 
 // Defaults for unset Deps.
@@ -136,6 +145,9 @@ func New(deps *Deps) *Service {
 	d := *deps
 	if d.Audit == nil {
 		d.Audit = noAudit{}
+	}
+	if d.Metrics == nil {
+		d.Metrics = noMetrics{}
 	}
 	if d.Logger == nil {
 		d.Logger = logging.NewNoOpLogger()

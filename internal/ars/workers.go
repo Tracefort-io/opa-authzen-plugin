@@ -54,6 +54,10 @@ func (s *Service) sweep(ctx context.Context) {
 		}
 		for _, t := range tasks {
 			s.d.Audit.Emit(ctx, t.Status, s.auditTask(t, nil))
+			s.completed(ctx, t)
+			if t.CompletedAt != nil {
+				s.d.Metrics.Observe(ctx, MetricSweepLag, seconds(t.CompletedAt.Sub(t.ExpiresAt)), nil)
+			}
 		}
 		if len(tasks) < sweepBatch {
 			return

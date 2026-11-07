@@ -1,6 +1,6 @@
 # Design: Access Request Service in the plugin
 
-Status: phase 1 implemented (branch `ars-phase1`); phase 2 implemented (branch `ars-phase2`, §17); phase 3 open
+Status: phase 1 implemented (branch `ars-phase1`); phase 2 implemented (branch `ars-phase2`, §17); phase 3 implemented (branch `ars-phase3`, §19)
 
 ## 1. Summary
 
@@ -352,7 +352,7 @@ The UI is any client that obtains a user token from the configured issuer and ca
 |---|---|
 | 1 | Config and migrations; single-item submit, status and cancel; `ars_caller`, `ars_workflow` (single step plus `auto`), `ars_approver`; approver API (list, view, decide, revoke); approval lookup at re-evaluation; expiry sweeper; idempotency; OpenTelemetry audit records |
 | 2 | Multi-step quorum; Bulk Profile (`items`, `partial`); Callback Profile with outbox; Actor Profile verification; retention purge (§17) |
-| 3 | DPoP/mTLS-bound tokens; approval cache; `approval.state` consumption by peer PDPs documented end to end; OpenTelemetry metrics |
+| 3 | DPoP/mTLS-bound tokens; PEP authentication on the AuthZEN API; approval cache; `approval.state` consumption by peer PDPs (`jwks_uri`, `approval_state_ttl`) documented end to end; OpenTelemetry metrics (§19) |
 
 Each phase ships as its own pull request with tests.
 
@@ -480,3 +480,71 @@ Revoked approvals are kept until `approved_until` too: their signed `approval.st
 - **`auto` may be per item** for bulk tasks (§17.2).
 - **Actor chains must match exactly** (§17.4).
 - **Retention purge is phase 2; metrics move to phase 3** (§16, §17.5).
+- **mTLS-bound tokens accept the certificate from either source**: TLS terminated by OPA, or a header forwarded by a trusted proxy (§19.1).
+- **DPoP freshness is `iat` plus `jti` replay protection**; server-issued nonces are not used (§19.1).
+- **PEP authentication reuses the same token checks, DPoP and mTLS** (§19.2).
+- **`approval_state_ttl` is configurable**; unset keeps `approval.state` valid until `approved_until` (§19.4).
+- **UI links are closed**: the URL templates of §5 are the implementation; nothing further is planned.
+
+## 19. Phase 3 design
+
+### 19.1 Sender-constrained tokens
+
+Both service APIs, and the AuthZEN API with `pep_auth` (§19.2), accept tokens bound to the caller's key, configured per API under `sender_constraint`:
+
+```yaml
+approver_auth:
+  issuers: [...]
+  sender_constraint:
+    require: false          # true: unbound bearer tokens are refused
+    dpop: {enabled: true, max_age: 60s}
+    mtls: {enabled: true, source: header, header: X-Forwarded-Client-Cert, format: envoy_xfcc}
+```
+
+A token with `cnf` is accepted only through the mechanism it names; one without `cnf` only as a bearer token, and only when `require` is false. A bound token sent as `Bearer`, or an unbound one sent as `DPoP`, is refused.
+
+**DPoP (RFC 9449).** The request carries `Authorization: DPoP <token>` and a `DPoP` proof:
+- header `typ` is `dpop+jwt`; `alg` is asymmetric (ES256, ES384, RS256, PS256, EdDSA); `jwk` is a public key;
+- the proof is signed by that key, whose RFC 7638 thumbprint equals the token's `cnf.jkt`;
+- `htm` equals the method; `htu` equals `base_url` plus the path, without query or fragment; `ath` is the base64url SHA-256 of the token;
+- `iat` is within `max_age` (default 60 s) with 30 s clock skew, and `jti` has not been seen. The service APIs record `jti` in `seen_jti`, shared by all replicas; the AuthZEN API records it per replica, keeping the database off the evaluation path, so a replay to another replica within `max_age` is not detected there.
+
+Server-issued nonces are not used. Failures are `401` with `WWW-Authenticate: DPoP error="invalid_dpop_proof", algs="…"` (`invalid_token` for the token itself).
+
+**mTLS-bound tokens (RFC 8705).** The token's `cnf.x5t#S256` must equal the base64url SHA-256 of the client certificate's DER, taken from:
+- `source: tls`: the connection, when OPA terminates TLS. OPA requests client certificates only with `--authentication=tls`, which then requires one for every endpoint;
+- `source: header`: a header set by the proxy that terminated mTLS. `format: envoy_xfcc` reads `Hash=` from Envoy's `X-Forwarded-Client-Cert` (the `Cert=` PEM when `Hash` is absent); `format: pem` reads a URL-encoded PEM certificate. The proxy must remove any copy of the header the client sent; the plugin cannot tell.
+
+### 19.2 PEP authentication on the AuthZEN API
+
+The Authorization API says the PDP SHOULD authenticate the calling PEP and recommends OAuth 2.0. With `pep_auth` (same shape as `caller_auth`, including `sender_constraint`), the evaluation, evaluations and search endpoints require a token from a listed issuer; anything else is `401` with `WWW-Authenticate` (Bearer or DPoP). Metadata and `/access/v1/jwks` stay open for discovery. Policies see the authenticated PEP as `input.pep` (`iss`, `sub`, `client_id`, `claims`); without `pep_auth`, `input.pep` is absent and nothing changes. This authenticates the PEP, not the subject the PEP reports.
+
+### 19.3 Approval cache
+
+`approval_cache_ttl` (default `0s`, off) caches, per replica, approvals found valid at re-evaluation, bounded in size (LRU) and never past `approved_until`. Revoked, expired and missing approvals are always looked up. A revocation clears the entry on the replica that served it; other replicas may accept a revoked approval for up to the TTL.
+
+### 19.4 Peer PDPs
+
+A PDP without access to the store verifies `approval.state` signatures through `approval_issuers`:
+- `jwks_uri` is accepted as an alternative to `jwks_file`, fetched and refreshed with the same rules as token issuers' keys, so key rotation needs no file distribution;
+- `approval_state_ttl` (configurable; unset keeps `approved_until`) sets each signed state's `exp` to the earlier of `approved_until` and signing time plus the TTL. Every status read signs a fresh state, so a PEP refreshes it by reading the task. A peer cannot see revocation; the TTL bounds how long it honours a revoked approval.
+- `approval_state_audiences` lists the peers' `base_url`s, named in the state's `aud` beside this PDP's. ARAP requires `aud` to identify the verifying PDP, so without it a peer with its own `base_url` refuses the state. (Added during implementation: the approved design did not cover it, and peers cannot work without it.)
+
+The README documents the setup end to end, and a test runs two plugin instances: one hosting the service, the other trusting it only through `approval_issuers`.
+
+### 19.5 Metrics
+
+OpenTelemetry metrics, exported over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is set:
+
+| Instrument | Type | Attributes |
+|---|---|---|
+| `authzen.ars.submissions` | counter | `outcome` (`pending`, `auto_decided`, `rejected`), `problem`; an idempotent retry counts again |
+| `authzen.ars.decisions` | counter | `decision` |
+| `authzen.ars.transitions` | counter | `status` |
+| `authzen.ars.approval_lookups` | counter | `result`, `cached` |
+| `authzen.ars.db_errors` | counter | `operation` |
+| `authzen.ars.auth_failures` | counter | `api`, `reason` |
+| `authzen.ars.sweep_lag` | histogram (s) | from a task's expiry to the sweep that expired it |
+| `authzen.ars.callback_deliveries` | counter | `outcome` (`delivered`, `retry`, `failed`) |
+| `authzen.ars.callback_latency` | histogram (s) | from completion to delivery |
+| `authzen.ars.pending_tasks`, `authzen.ars.callback_backlog` | gauge | read from the store at collection; every replica reports the same total |

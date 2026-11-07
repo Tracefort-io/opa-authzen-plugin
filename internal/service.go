@@ -116,29 +116,37 @@ func (p *AuthZenPlugin) startService(ctx context.Context) error {
 	} else {
 		p.logger.Warn("AuthZEN access request service: no OTLP endpoint is configured (OTEL_EXPORTER_OTLP_ENDPOINT), so audit records are not exported")
 	}
+	// The service APIs' DPoP proofs are remembered in the store, shared by
+	// every replica.
+	sc.replay.set(storeReplay{remember: st.RememberJTI})
+	cache := newApprovalCache(sc.approvalCacheTTL)
 	svc := ars.New(&ars.Deps{
-		Store:                st,
-		Callers:              sc.callers,
-		Approvers:            sc.approvers,
-		Eval:                 p.evalServiceRule,
-		Crypto:               pdpCrypto{ac: &cfg.AccessRequest},
-		Rules:                ars.Rules{Caller: sc.Rules.Caller, Workflow: sc.Rules.Workflow, Approver: sc.Rules.Approver},
-		Links:                ars.Links{Ticket: sc.Links.Ticket, Review: sc.Links.Review},
-		BaseURL:              cfg.BaseURL,
-		Audience:             cfg.AccessRequest.Audience,
-		TaskTTL:              sc.taskTTL,
-		MaxApprovalTTL:       sc.maxApprovalTTL,
-		IdempotencyRetention: sc.idempotencyRetention,
-		MaxItems:             sc.MaxItems,
-		MaxSteps:             sc.MaxSteps,
-		Callbacks:            sc.callbacks,
-		Logger:               p.logger,
-		Audit:                audit,
-		Now:                  p.now,
+		Store:                  st,
+		Callers:                sc.callers,
+		Approvers:              sc.approvers,
+		Eval:                   p.evalServiceRule,
+		Crypto:                 pdpCrypto{ac: &cfg.AccessRequest},
+		Rules:                  ars.Rules{Caller: sc.Rules.Caller, Workflow: sc.Rules.Workflow, Approver: sc.Rules.Approver},
+		Links:                  ars.Links{Ticket: sc.Links.Ticket, Review: sc.Links.Review},
+		BaseURL:                cfg.BaseURL,
+		Audience:               cfg.AccessRequest.Audience,
+		TaskTTL:                sc.taskTTL,
+		MaxApprovalTTL:         sc.maxApprovalTTL,
+		IdempotencyRetention:   sc.idempotencyRetention,
+		MaxItems:               sc.MaxItems,
+		MaxSteps:               sc.MaxSteps,
+		Callbacks:              sc.callbacks,
+		ApprovalStateTTL:       sc.approvalStateTTL,
+		ApprovalStateAudiences: sc.ApprovalStateAudiences,
+		OnRevoke:               cache.drop,
+		Logger:                 p.logger,
+		Audit:                  audit,
+		Metrics:                p.metrics,
+		Now:                    p.now,
 	})
 	workerCtx, cancel := context.WithCancel(context.Background())
 	p.mu.Lock()
-	p.arsService, p.arsStore, p.arsCancel, p.arsAudit = svc, st, cancel, auditor
+	p.arsService, p.arsStore, p.arsCancel, p.arsAudit, p.approvalCache = svc, st, cancel, auditor, cache
 	p.mu.Unlock()
 	go svc.RunSweeper(workerCtx)
 	go svc.RunPurger(workerCtx)
@@ -152,7 +160,7 @@ func (p *AuthZenPlugin) startService(ctx context.Context) error {
 func (p *AuthZenPlugin) stopService() {
 	p.mu.Lock()
 	cancel, st, auditor := p.arsCancel, p.arsStore, p.arsAudit
-	p.arsService, p.arsStore, p.arsCancel, p.arsAudit = nil, nil, nil, nil
+	p.arsService, p.arsStore, p.arsCancel, p.arsAudit, p.approvalCache = nil, nil, nil, nil, nil
 	p.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -166,6 +174,51 @@ func (p *AuthZenPlugin) stopService() {
 	}
 	if st != nil {
 		st.Close()
+	}
+}
+
+// startMetrics starts OpenTelemetry metrics when an OTLP endpoint is
+// configured; without one, measurements are discarded. The backlog gauges
+// read the service's store while it runs.
+func (p *AuthZenPlugin) startMetrics(ctx context.Context) error {
+	p.mu.RLock()
+	running := p.otelMetrics != nil
+	p.mu.RUnlock()
+	if running {
+		return nil
+	}
+	m, err := newOTelMetrics(ctx, func() store.Store {
+		p.mu.RLock()
+		defer p.mu.RUnlock()
+		return p.arsStore
+	})
+	if err != nil {
+		return fmt.Errorf("metrics: %w", err)
+	}
+	if m == nil {
+		return nil
+	}
+	p.mu.Lock()
+	p.otelMetrics = m
+	p.mu.Unlock()
+	p.metrics.set(m)
+	return nil
+}
+
+// stopMetrics flushes and stops OpenTelemetry metrics.
+func (p *AuthZenPlugin) stopMetrics() {
+	p.mu.Lock()
+	m := p.otelMetrics
+	p.otelMetrics = nil
+	p.mu.Unlock()
+	if m == nil {
+		return
+	}
+	p.metrics.set(nil)
+	ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+	if err := m.Shutdown(ctx); err != nil {
+		p.logger.Warn("AuthZEN: flushing metrics: %v", err)
 	}
 }
 

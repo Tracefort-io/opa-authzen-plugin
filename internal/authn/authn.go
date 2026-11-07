@@ -1,5 +1,7 @@
-// Package authn validates OAuth 2.0 bearer tokens (RFC 6750) issued as JWTs
-// by configured issuers, for the Access Request Service and approver APIs.
+// Package authn validates OAuth 2.0 access tokens issued as JWTs by
+// configured issuers, for the Access Request Service, approver and AuthZEN
+// APIs: bearer tokens (RFC 6750) and sender-constrained tokens, DPoP
+// (RFC 9449) and certificate-bound (RFC 8705), see bound.go.
 //
 // A token is accepted when its signature verifies against a key from its
 // issuer's JWK Set and its `iss`, `aud`, `exp` and `nbf` claims check out.
@@ -62,11 +64,15 @@ type Identity struct {
 // for audit records.
 func (i *Identity) Key() string { return i.Iss + "|" + i.Sub }
 
-// Verifier validates bearer tokens from a fixed set of issuers.
+// Verifier validates tokens from a fixed set of issuers: bearer tokens and,
+// with WithSenderConstraint, DPoP and certificate-bound tokens.
 type Verifier struct {
 	issuers map[string]*issuerKeys
 	client  *http.Client
 	now     func() time.Time
+	sc      *SenderConstraint
+	baseURL string
+	replay  Replay
 }
 
 type issuerKeys struct {
@@ -105,20 +111,49 @@ func NewVerifier(issuers []Issuer, client *http.Client) (*Verifier, error) {
 	return v, nil
 }
 
-// Authenticate validates the request's bearer token.
+// Authenticate validates the request's token: `Bearer`, or `DPoP` with a
+// proof when DPoP is enabled. A token bound in `cnf` is accepted only with
+// proof of possession of its key.
 func (v *Verifier) Authenticate(r *http.Request) (*Identity, error) {
 	auth := r.Header.Get("Authorization")
 	scheme, token, ok := strings.Cut(auth, " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(token) == "" {
-		return nil, fmt.Errorf("%w: missing bearer token", ErrUnauthenticated)
+	scheme, token = strings.ToLower(scheme), strings.TrimSpace(token)
+	switch {
+	case !ok || token == "":
+		return nil, &Error{Reason: "missing token"}
+	case scheme == "dpop" && !v.sc.dpopEnabled():
+		return nil, failure("invalid_request", "the DPoP scheme is not accepted")
+	case scheme != "bearer" && scheme != "dpop":
+		return nil, &Error{Reason: "unsupported authorization scheme"}
 	}
-	return v.Verify(r.Context(), strings.TrimSpace(token))
+	id, err := v.verify(r.Context(), token)
+	if err != nil {
+		return nil, err
+	}
+	if err := v.bind(r, scheme, token, id.Claims); err != nil {
+		return nil, err
+	}
+	return id, nil
 }
 
-// Verify validates one compact JWT.
+// Verify validates one compact JWT used as a bearer token. A
+// sender-constrained token is refused: without the request, possession of
+// its key cannot be proven.
 func (v *Verifier) Verify(ctx context.Context, token string) (*Identity, error) {
+	id, err := v.verify(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := id.Claims["cnf"]; ok {
+		return nil, failure("invalid_token", "sender-constrained tokens need proof of possession")
+	}
+	return id, nil
+}
+
+// verify checks a JWT's signature and claims, leaving `cnf` to the caller.
+func (v *Verifier) verify(ctx context.Context, token string) (*Identity, error) {
 	fail := func(format string, args ...any) (*Identity, error) {
-		return nil, fmt.Errorf("%w: "+format, append([]any{ErrUnauthenticated}, args...)...)
+		return nil, failure("invalid_token", format, args...)
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
@@ -172,12 +207,6 @@ func (v *Verifier) Verify(ctx context.Context, token string) (*Identity, error) 
 	if nbf, ok := numericDate(claims["nbf"]); ok && now.Add(clockSkew).Before(nbf) {
 		return fail("token is not yet valid")
 	}
-	// A sender-constrained token (DPoP, mTLS) needs proof of possession,
-	// which this version does not check; accepting it as a bearer token
-	// would discard the constraint.
-	if _, ok := claims["cnf"]; ok {
-		return fail("sender-constrained tokens are not supported")
-	}
 	sub, _ := claims["sub"].(string)
 	if sub == "" {
 		return fail("sub is required")
@@ -217,6 +246,33 @@ func (ik *issuerKeys) keys(ctx context.Context, client *http.Client, now time.Ti
 		ik.set, ik.fetchedAt = set, now
 	}
 	return ik.set, nil
+}
+
+// RemoteKeys is a JWK Set fetched from a URL and cached, refreshed as
+// token issuers' keys are: after jwksMaxAge, or on an unknown kid at most
+// every jwksMinRefresh, keeping the last good set through a failed fetch.
+type RemoteKeys struct {
+	ik     issuerKeys
+	client *http.Client
+	now    func() time.Time
+}
+
+// NewRemoteKeys returns the key set published at uri, fetched lazily.
+func NewRemoteKeys(uri string, client *http.Client) (*RemoteKeys, error) {
+	uri = strings.TrimSpace(uri)
+	if !strings.HasPrefix(uri, "https://") && !strings.HasPrefix(uri, "http://") {
+		return nil, fmt.Errorf("jwks_uri %q must be an http(s) URL", uri)
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
+	return &RemoteKeys{ik: issuerKeys{cfg: Issuer{JWKSURI: uri}}, client: client, now: time.Now}, nil
+}
+
+// Keys returns the current set, refetching it when stale or when it lacks
+// kid.
+func (r *RemoteKeys) Keys(ctx context.Context, kid string) (jwk.Set, error) {
+	return r.ik.keys(ctx, r.client, r.now(), kid)
 }
 
 func fetchJWKS(ctx context.Context, client *http.Client, uri string) (jwk.Set, error) {

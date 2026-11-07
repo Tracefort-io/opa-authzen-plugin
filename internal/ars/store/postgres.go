@@ -652,6 +652,24 @@ func (p *Postgres) FailCallback(ctx context.Context, id int64, now time.Time, la
 	return err
 }
 
+// RememberJTI implements Store.
+func (p *Postgres) RememberJTI(ctx context.Context, id string, expires time.Time) (bool, error) {
+	tag, err := p.pool.Exec(ctx, "INSERT INTO seen_jti (jti, expires_at) VALUES ($1, $2) ON CONFLICT DO NOTHING", id, expires)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// Backlog implements Store.
+func (p *Postgres) Backlog(ctx context.Context) (int64, int64, error) {
+	var pending, undelivered int64
+	err := p.pool.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM tasks WHERE status = 'pending'),
+			(SELECT count(*) FROM callback_outbox WHERE delivered_at IS NULL AND failed_at IS NULL)`).Scan(&pending, &undelivered)
+	return pending, undelivered, err
+}
+
 // Purge implements Store. Deleting a task deletes its items, decisions,
 // approvals and callback rows with it (ON DELETE CASCADE).
 func (p *Postgres) Purge(ctx context.Context, c PurgeCutoffs, limit int) (int, error) {

@@ -41,6 +41,10 @@ plugins:
     # X-Forwarded-Proto/X-Forwarded-Host (first value) or Host. Required by the
     # access_request signing and approval settings below.
     # base_url: "https://pdp.example.com"
+    # Optional: require PEPs to authenticate to the evaluation and search
+    # endpoints (README: "PEP authentication"); policies see input.pep.
+    # pep_auth:
+    #   issuers: [{issuer: "https://idp.example.com", audience: "https://pdp.example.com", jwks_uri: "https://idp.example.com/.well-known/jwks.json"}]
     # Optional: the PDP's part of the Access Request and Approval Profile.
     # Requestable denials returned by `decision_context` are completed with
     # `expires_at`, `evaluation_id` and, with a signing key, a signed
@@ -65,6 +69,14 @@ plugins:
     #     approver_auth:
     #       issuers: [{issuer: "https://idp.example.com", audience: "authzen-approver-api", jwks_uri: "https://idp.example.com/.well-known/jwks.json"}]
     #     rules: {caller: ars_caller, workflow: ars_workflow, approver: ars_approver}
+    #     # Optional: accept DPoP-bound caller tokens (README: "Sender-
+    #     # constrained tokens"); the same block works on approver_auth.
+    #     #   caller_auth: {issuers: [...], sender_constraint: {dpop: {enabled: true}}}
+    #     # Optional: cache valid approvals per replica, and cap signed
+    #     # approval.state for peer PDPs listed as audiences.
+    #     approval_cache_ttl: 30s
+    #     approval_state_ttl: 15m
+    #     approval_state_audiences: ["https://pdp-b.example.com"]
     #     # Optional: callback notifications, keyed per host by a secret of
     #     # at least 32 bytes read from the environment.
     #     callbacks:

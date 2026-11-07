@@ -145,12 +145,24 @@ func (s *Service) itemResult(ctx context.Context, approvalID string) (map[string
 }
 
 // approvalClaims are the approval.state claims, in the form the plugin's
-// signed-approval verification reads.
+// signed-approval verification reads. With ApprovalStateTTL, `exp` is the
+// earlier of approved_until and now plus the TTL: a PDP verifying the
+// signature cannot see revocation, and the TTL bounds how long it honours
+// a revoked approval. A PEP refreshes the state by reading the task.
 func (s *Service) approvalClaims(a *store.Approval) map[string]any {
+	exp := a.ApprovedUntil
+	if ttl := s.d.ApprovalStateTTL; ttl > 0 && s.now().Add(ttl).Before(exp) {
+		exp = s.now().Add(ttl)
+	}
+	// ARAP: `aud` identifies the verifying PDPs, this one and any peer.
+	var aud any = s.d.BaseURL
+	if len(s.d.ApprovalStateAudiences) > 0 {
+		aud = append([]string{s.d.BaseURL}, s.d.ApprovalStateAudiences...)
+	}
 	return map[string]any{
 		"iss":                     s.d.BaseURL,
-		"aud":                     s.d.BaseURL,
-		"exp":                     a.ApprovedUntil.Unix(),
+		"aud":                     aud,
+		"exp":                     exp.Unix(),
 		"approval_id":             a.ID,
 		"task_id":                 a.TaskID,
 		"approved_at":             a.ApprovedAt.UTC().Format(time.RFC3339),

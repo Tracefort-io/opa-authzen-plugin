@@ -139,6 +139,11 @@ type Config struct {
 	// and Approval Profile beyond discovery: requestable-denial issuance and
 	// approval verification at re-evaluation. See access_request.go.
 	AccessRequest AccessRequestConfig `json:"access_request,omitempty"`
+	// PEPAuth, when set, requires the calling PEP to authenticate to the
+	// evaluation and search endpoints with a token from a listed issuer
+	// (design §19.2; the Authorization API's "the PDP SHOULD authenticate
+	// the calling PEP"). Policies see the PEP as input.pep.
+	PEPAuth *AuthConfig `json:"pep_auth,omitempty"`
 }
 
 // SearchConfig configures the optional Search APIs (Section 8 of the AuthZEN
@@ -235,6 +240,10 @@ func Validate(_ *plugins.Manager, bs []byte) (*Config, error) {
 		if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 			return nil, fmt.Errorf("base_url %q must be an http(s) URL with a host and no query or fragment", cfg.BaseURL)
 		}
+	}
+
+	if err := cfg.loadPEPAuth(); err != nil {
+		return nil, err
 	}
 
 	// Before signed_metadata, which is checked against the jwks_uri this may
@@ -428,6 +437,13 @@ type AuthZenPlugin struct {
 	arsStore   store.Store
 	arsCancel  context.CancelFunc
 	arsAudit   *otelAuditor
+	// metrics is the plugin's ars.Metrics; otelMetrics backs it once started
+	// with an OTLP endpoint.
+	metrics     *pluginMetrics
+	otelMetrics *otelMetrics
+	// approvalCache caches valid approvals at re-evaluation
+	// (approval_cache_ttl), or is nil.
+	approvalCache *approvalCache
 	// openStore opens the service's store; tests replace it.
 	openStore func(ctx context.Context, s *ServiceConfig) (store.Store, error)
 }
@@ -440,6 +456,7 @@ func New(m *plugins.Manager, cfg *Config) *AuthZenPlugin {
 		logger:    m.Logger().WithFields(map[string]any{"plugin": PluginName}),
 		now:       time.Now,
 		openStore: openPostgres,
+		metrics:   &pluginMetrics{},
 	}
 }
 
@@ -453,6 +470,11 @@ func (p *AuthZenPlugin) Start(ctx context.Context) error {
 	serviceEnabled := p.cfg.AccessRequest.Service.Enabled
 	p.mu.Unlock()
 
+	if err := p.startMetrics(ctx); err != nil {
+		p.manager.UpdatePluginStatus(PluginName, &plugins.Status{State: plugins.StateErr, Message: err.Error()})
+		return err
+	}
+
 	if err := p.startService(ctx); err != nil {
 		p.manager.UpdatePluginStatus(PluginName, &plugins.Status{State: plugins.StateErr, Message: err.Error()})
 		return err
@@ -460,11 +482,11 @@ func (p *AuthZenPlugin) Start(ctx context.Context) error {
 
 	if !alreadyStarted {
 		p.logger.Info("Starting AuthZEN plugin")
-		p.manager.ExtraRoute("POST /access/v1/evaluation", "authzen/evaluation", p.handleEvaluation)
-		p.manager.ExtraRoute("POST /access/v1/evaluations", "authzen/evaluations", p.handleEvaluations)
-		p.manager.ExtraRoute("POST /access/v1/search/subject", "authzen/search-subject", p.handleSubjectSearch)
-		p.manager.ExtraRoute("POST /access/v1/search/resource", "authzen/search-resource", p.handleResourceSearch)
-		p.manager.ExtraRoute("POST /access/v1/search/action", "authzen/search-action", p.handleActionSearch)
+		p.manager.ExtraRoute("POST /access/v1/evaluation", "authzen/evaluation", p.withPEPAuth(p.handleEvaluation))
+		p.manager.ExtraRoute("POST /access/v1/evaluations", "authzen/evaluations", p.withPEPAuth(p.handleEvaluations))
+		p.manager.ExtraRoute("POST /access/v1/search/subject", "authzen/search-subject", p.withPEPAuth(p.handleSubjectSearch))
+		p.manager.ExtraRoute("POST /access/v1/search/resource", "authzen/search-resource", p.withPEPAuth(p.handleResourceSearch))
+		p.manager.ExtraRoute("POST /access/v1/search/action", "authzen/search-action", p.withPEPAuth(p.handleActionSearch))
 		p.manager.ExtraRoute("GET /.well-known/authzen-configuration", "authzen/well-known", p.handleWellKnown)
 		p.manager.ExtraRoute("GET "+jwksPath, "authzen/jwks", p.handleJWKS)
 		if serviceEnabled {
@@ -484,6 +506,7 @@ func (p *AuthZenPlugin) Stop(_ context.Context) {
 	p.stopped = true
 	p.mu.Unlock()
 	p.stopService()
+	p.stopMetrics()
 	p.manager.UpdatePluginStatus(PluginName, &plugins.Status{State: plugins.StateNotReady})
 }
 
@@ -1028,6 +1051,7 @@ func (p *AuthZenPlugin) configSnapshot() evalConfig {
 		baseURL:               p.cfg.BaseURL,
 		accessRequest:         p.cfg.AccessRequest,
 		approvals:             p.arsStore,
+		approvalCache:         p.approvalCache,
 	}
 }
 
@@ -1040,6 +1064,8 @@ type evalConfig struct {
 	accessRequest               AccessRequestConfig
 	// approvals is the hosted Access Request Service's store, or nil.
 	approvals store.Store
+	// approvalCache caches approvals found in force, or is nil.
+	approvalCache *approvalCache
 }
 
 // prepareInput applies the profile processing that runs on a validated input
@@ -1049,6 +1075,7 @@ type evalConfig struct {
 //
 // It fails only when approval state cannot be read, which fails the request.
 func (p *AuthZenPlugin) prepareInput(ctx context.Context, input map[string]any, snap *evalConfig) error {
+	addPEP(ctx, input)
 	applyObligationNegotiation(input, snap.obligations)
 	return p.verifyApproval(ctx, input, snap)
 }
@@ -1515,6 +1542,7 @@ func (p *AuthZenPlugin) handleSearch(w http.ResponseWriter, r *http.Request, kin
 	// Before the pagination hash below, so values the PDP must ignore cannot
 	// break a follow-up page.
 	applyObligationNegotiation(input, obligations)
+	addPEP(r.Context(), input)
 
 	limit, errMsg := resolveSearchLimit(req.Page, search.MaxLimit)
 	if errMsg != "" {

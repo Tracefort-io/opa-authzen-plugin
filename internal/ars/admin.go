@@ -128,9 +128,8 @@ func (s *Service) adminView(t *store.Task) map[string]any {
 // handleListTasks serves GET /access/v1/admin/tasks: pending tasks whose
 // current step lists the approver and that the approver rule lets them see.
 func (s *Service) handleListTasks(w http.ResponseWriter, r *http.Request) {
-	approver, err := s.d.Approvers.Authenticate(r)
-	if err != nil {
-		unauthenticated(w)
+	approver, ok := s.authenticate(w, r, s.d.Approvers, "approver")
+	if !ok {
 		return
 	}
 	q := r.URL.Query()
@@ -178,9 +177,8 @@ func (s *Service) handleListTasks(w http.ResponseWriter, r *http.Request) {
 // loadForApprover authenticates the approver, loads the task, and checks
 // the approver rule for op. A task the approver may not see is unknown.
 func (s *Service) loadForApprover(w http.ResponseWriter, r *http.Request, op string) (*store.Task, *authn.Identity, bool) {
-	approver, err := s.d.Approvers.Authenticate(r)
-	if err != nil {
-		unauthenticated(w)
+	approver, ok := s.authenticate(w, r, s.d.Approvers, "approver")
+	if !ok {
 		return nil, nil, false
 	}
 	t, err := s.d.Store.GetTask(r.Context(), r.PathValue("id"))
@@ -193,7 +191,7 @@ func (s *Service) loadForApprover(w http.ResponseWriter, r *http.Request, op str
 		internalError(w)
 		return nil, nil, false
 	}
-	ok, err := s.allowed(r.Context(), s.d.Rules.Approver, map[string]any{"operation": op, "approver": approverInput(approver), "task": ruleTask(t)})
+	ok, err = s.allowed(r.Context(), s.d.Rules.Approver, map[string]any{"operation": op, "approver": approverInput(approver), "task": ruleTask(t)})
 	if err != nil {
 		s.d.Logger.Error("AuthZEN approver API: approver rule: %v", err)
 		internalError(w)
@@ -302,6 +300,7 @@ func (s *Service) handleDecide(w http.ResponseWriter, r *http.Request) {
 	attrs := s.auditTask(updated, approver)
 	attrs["decision"], attrs["comment"] = body.Decision, body.Comment
 	s.d.Audit.Emit(r.Context(), "decided", attrs)
+	s.d.Metrics.Count(r.Context(), MetricDecisions, map[string]string{"decision": body.Decision})
 	for _, idx := range advanced {
 		sc := s.auditTask(updated, approver)
 		sc["item"], sc["step"] = strconv.Itoa(idx), strconv.Itoa(updated.Items[idx].CurrentStep)
@@ -309,6 +308,7 @@ func (s *Service) handleDecide(w http.ResponseWriter, r *http.Request) {
 	}
 	if store.IsTerminal(updated.Status) {
 		s.d.Audit.Emit(r.Context(), updated.Status, s.auditTask(updated, approver))
+		s.completed(r.Context(), updated)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"task": s.adminView(updated)})
 }
@@ -402,9 +402,8 @@ func (s *Service) applyDecision(t *store.Task, targets []int, approver *authn.Id
 // handleRevoke serves POST /access/v1/admin/approvals/{id}/revoke. The next
 // re-evaluation presenting the approval is denied.
 func (s *Service) handleRevoke(w http.ResponseWriter, r *http.Request) {
-	approver, err := s.d.Approvers.Authenticate(r)
-	if err != nil {
-		unauthenticated(w)
+	approver, ok := s.authenticate(w, r, s.d.Approvers, "approver")
+	if !ok {
 		return
 	}
 	var body struct {
@@ -435,7 +434,7 @@ func (s *Service) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		internalError(w)
 		return
 	}
-	ok, err := s.allowed(r.Context(), s.d.Rules.Approver, map[string]any{
+	ok, err = s.allowed(r.Context(), s.d.Rules.Approver, map[string]any{
 		"operation": "revoke", "approver": approverInput(approver), "task": ruleTask(t),
 		"approval": map[string]any{"id": a.ID, "approved_until": a.ApprovedUntil.UTC().Format(time.RFC3339)},
 	})
@@ -461,6 +460,9 @@ func (s *Service) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	attrs := s.auditTask(t, approver)
 	attrs["approval_id"], attrs["reason"] = revoked.ID, body.Reason
 	s.d.Audit.Emit(r.Context(), "revoked", attrs)
+	if s.d.OnRevoke != nil {
+		s.d.OnRevoke(revoked.ID)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"approval": map[string]any{
 		"id":             revoked.ID,
 		"task_id":        revoked.TaskID,

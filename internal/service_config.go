@@ -46,14 +46,27 @@ type ServiceConfig struct {
 	// Callbacks enables the Callback Profile; without it a submitted
 	// `callback` is rejected.
 	Callbacks *CallbacksConfig `json:"callbacks,omitempty"`
+	// ApprovalCacheTTL caches valid approvals at re-evaluation for this
+	// long per replica, as a Go duration; unset or 0 disables the cache.
+	ApprovalCacheTTL string `json:"approval_cache_ttl,omitempty"`
+	// ApprovalStateTTL caps each signed approval.state at signing time plus
+	// this, as a Go duration; unset keeps it valid until approved_until.
+	ApprovalStateTTL string `json:"approval_state_ttl,omitempty"`
+	// ApprovalStateAudiences lists other PDPs that verify approval.state by
+	// signature (their base_url); each is named in the state's `aud`.
+	ApprovalStateAudiences []string `json:"approval_state_audiences,omitempty"`
 
 	dsn                  string
 	taskTTL              time.Duration
 	maxApprovalTTL       time.Duration
 	idempotencyRetention time.Duration
+	approvalCacheTTL     time.Duration
+	approvalStateTTL     time.Duration
 	callers              *authn.Verifier
 	approvers            *authn.Verifier
 	callbacks            *ars.CallbackConfig
+	// replay records the service APIs' DPoP proofs in the store, once open.
+	replay *replayRef
 }
 
 // CallbacksConfig lists the hosts callbacks may be sent to.
@@ -87,9 +100,13 @@ type DatabaseConfig struct {
 	MaxConns int32  `json:"max_conns,omitempty"`
 }
 
-// AuthConfig lists the token issuers trusted for one API.
+// AuthConfig lists the token issuers trusted for one API and, optionally,
+// the proof of possession its tokens need (design §19.1).
 type AuthConfig struct {
-	Issuers []authn.Issuer `json:"issuers"`
+	Issuers          []authn.Issuer          `json:"issuers"`
+	SenderConstraint *authn.SenderConstraint `json:"sender_constraint,omitempty"`
+
+	verifier *authn.Verifier
 }
 
 // ServiceRules names the Rego rules, in the package at path, that decide
@@ -146,11 +163,12 @@ func (s *ServiceConfig) load(cfg *Config, ac *AccessRequestConfig) error {
 	}
 
 	var err error
-	if s.callers, err = authn.NewVerifier(s.CallerAuth.Issuers, nil); err != nil {
-		return fmt.Errorf("service caller_auth: %w", err)
+	s.replay = &replayRef{}
+	if s.callers, err = s.CallerAuth.build("service caller_auth", cfg.BaseURL, s.replay); err != nil {
+		return err
 	}
-	if s.approvers, err = authn.NewVerifier(s.ApproverAuth.Issuers, nil); err != nil {
-		return fmt.Errorf("service approver_auth: %w", err)
+	if s.approvers, err = s.ApproverAuth.build("service approver_auth", cfg.BaseURL, s.replay); err != nil {
+		return err
 	}
 
 	for _, d := range []struct {
@@ -172,6 +190,32 @@ func (s *ServiceConfig) load(cfg *Config, ac *AccessRequestConfig) error {
 			return fmt.Errorf("service %s %q must be a positive duration", d.name, d.src)
 		}
 		*d.dst = v
+	}
+	// Optional durations: unset or zero leaves the feature off.
+	for _, d := range []struct {
+		name string
+		src  string
+		dst  *time.Duration
+	}{
+		{"approval_cache_ttl", s.ApprovalCacheTTL, &s.approvalCacheTTL},
+		{"approval_state_ttl", s.ApprovalStateTTL, &s.approvalStateTTL},
+	} {
+		if strings.TrimSpace(d.src) == "" {
+			continue
+		}
+		v, err := time.ParseDuration(strings.TrimSpace(d.src))
+		if err != nil || v < 0 {
+			return fmt.Errorf("service %s %q must be a non-negative duration", d.name, d.src)
+		}
+		*d.dst = v
+	}
+
+	for i, a := range s.ApprovalStateAudiences {
+		a = strings.TrimRight(strings.TrimSpace(a), "/")
+		if u, err := url.Parse(a); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			return fmt.Errorf("service approval_state_audiences[%d] %q must be a PDP's http(s) base_url", i, s.ApprovalStateAudiences[i])
+		}
+		s.ApprovalStateAudiences[i] = a
 	}
 
 	for name, v := range map[string]int{"max_items": s.MaxItems, "max_steps": s.MaxSteps} {

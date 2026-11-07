@@ -103,6 +103,7 @@ func TestStoreConformance(t *testing.T) {
 			t.Run("bulk expiry", func(t *testing.T) { testBulkExpiry(t, open(t)) })
 			t.Run("callbacks", func(t *testing.T) { testCallbacks(t, open(t)) })
 			t.Run("purge", func(t *testing.T) { testPurge(t, open(t)) })
+			t.Run("remember jti and backlog", func(t *testing.T) { testRememberAndBacklog(t, open(t)) })
 		})
 	}
 }
@@ -298,6 +299,27 @@ func testCallbacks(t *testing.T, s Store) {
 	}
 	if d, _ := s.ClaimCallbacks(ctx, t0.Add(time.Hour), time.Minute, 10); len(d) != 0 {
 		t.Fatalf("delivered notification claimed again: %+v", d)
+	}
+}
+
+func testRememberAndBacklog(t *testing.T, s Store) {
+	ctx := context.Background()
+	for i, want := range []bool{true, false} {
+		if fresh, err := s.RememberJTI(ctx, "dpop:k:p1", t0.Add(time.Minute)); err != nil || fresh != want {
+			t.Fatalf("remember #%d: %v %v", i, fresh, err)
+		}
+	}
+	if _, _, err := s.CreateTask(ctx, &NewTask{Task: newTask("arq_1")}, t0); err != nil {
+		t.Fatal(err)
+	}
+	done := bulkTask("arq_2")
+	done.Status, done.CompletedAt = StatusDenied, &t0
+	done.Items[0].Status, done.Items[1].Status = StatusDenied, StatusDenied
+	if _, _, err := s.CreateTask(ctx, &NewTask{Task: done}, t0); err != nil {
+		t.Fatal(err)
+	}
+	if pending, undelivered, err := s.Backlog(ctx); err != nil || pending != 1 || undelivered != 1 {
+		t.Fatalf("backlog: %d pending, %d undelivered, %v", pending, undelivered, err)
 	}
 }
 
